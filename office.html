@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vgram Office</title>
+<link rel="icon" href="icon.svg">
+<link rel="stylesheet" href="common.css">
+<script src="config.js"></script>
+</head>
+<body>
+<div class="topbar" id="topbar"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div id="app"></div>
+<script>
+/* Office page for the stock room (dispatch, supplier receipts, packing slips) and the admin
+   (daily report, sales upload, opening stock, close day). Needs internet. */
+'use strict';
+const $app = document.getElementById('app');
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+const todayMNL = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+const fmt = (d) => d ? new Date(d).toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'never';
+const num = (v) => { const n = Number(v); return isNaN(n) ? 0 : n; };
+
+const U = { pin: sessionStorage.getItem('vg.pin') || '', role: sessionStorage.getItem('vg.role') || '', name: sessionStorage.getItem('vg.name') || '',
+  tab: '', msg: null, busy: false, sr: null, cart: {}, dest: '', find: '', slip: null, rep: null, repDate: todayMNL(), sales: null, stockRows: null };
+
+let inflight = 0, toastTimer = null;
+function bar(d) { inflight = Math.max(0, inflight + d); document.getElementById('topbar').classList.toggle('on', inflight > 0); }
+function toast(kind, text, ms) {
+  const t = document.getElementById('toast'); clearTimeout(toastTimer);
+  if (!kind) { t.className = 'toast'; return; }
+  t.className = 'toast show ' + kind;
+  t.innerHTML = (kind === 'work' ? '<span class="spin"></span>' : kind === 'ok' ? '<span>&#10003;</span>' : '<span>!</span>') + '<span>' + esc(text) + '</span>';
+  if (ms) toastTimer = setTimeout(() => { t.className = 'toast'; }, ms);
+}
+// Runs a save: shows "saving" right away, locks the buttons, then shows done or the error.
+async function saving(label, fn, doneText) {
+  if (U.busy) return;
+  U.busy = true; toast('work', label); render();
+  try { const r = await fn(); toast('ok', typeof doneText === 'function' ? doneText(r) : doneText, 5000); return r; }
+  catch (e) { msg('bad', e.message); toast('bad', e.message, 7000); }
+  finally { U.busy = false; render(); }
+}
+async function api(body) {
+  bar(1);
+  try { return await api_(body); } finally { bar(-1); }
+}
+async function api_(body) {
+  const url = window.VGRAM_API;
+  if (!url || url.indexOf('http') !== 0) throw new Error('The app address is not set yet (web/config.js).');
+  let res;
+  try { res = await fetch(url, { method: 'POST', body: JSON.stringify(Object.assign({ pin: U.pin }, body)) }); }
+  catch (e) { throw new Error('No internet connection. Try again when connected.'); }
+  let j; try { j = await res.json(); } catch (e) { throw new Error('The server did not answer properly. Try again.'); }
+  if (!j.ok) throw new Error(j.error || 'Something went wrong.');
+  return j;
+}
+
+function msg(k, t) { U.msg = { k, t }; }
+function tabsFor() { return U.role === 'admin' ? ['dispatch', 'transfers', 'supplier', 'report', 'sales', 'opening', 'stock'] : ['dispatch', 'transfers', 'supplier']; }
+const TAB_NAME = { dispatch: 'Dispatch', transfers: 'Transfers', supplier: 'Supplier receipt', report: 'Daily report', sales: 'Upload sales', opening: 'Opening stock', stock: 'Stock lookup' };
+
+function render() {
+  if (!U.role) return login();
+  if (!U.tab) U.tab = 'dispatch';
+  const v = { dispatch: vDispatch, transfers: vTransfers, supplier: vSupplier, report: vReport, sales: vSales, opening: vOpening, stock: vStock }[U.tab]();
+  $app.innerHTML = `<div class="bar noprint"><div><b>Vgram Office</b><small>${esc(U.name)} · ${U.role === 'admin' ? 'Admin' : 'Stock room'}</small></div><button class="btn sm" id="out">Sign out</button></div>
+    <div class="wrap" style="max-width:1100px"><div class="top-tabs noprint">${tabsFor().map((t) => `<button data-t="${t}" class="${U.tab === t ? 'on' : ''}">${TAB_NAME[t]}</button>`).join('')}</div>
+    ${U.msg ? `<div class="msg ${U.msg.k} noprint">${esc(U.msg.t)}</div>` : ''}${v}</div>`;
+  document.getElementById('out').onclick = () => { sessionStorage.clear(); U.role = ''; U.pin = ''; render(); };
+  document.querySelectorAll('[data-t]').forEach((b) => b.onclick = () => { U.tab = b.dataset.t; U.msg = null; U.slip = null; enter(); });
+  bind();
+}
+
+async function enter() {
+  render();
+  try {
+    if (['dispatch', 'transfers', 'supplier', 'opening', 'stock'].includes(U.tab) && !U.sr) { U.sr = await api({ action: 'stockroom_data' }); render(); }
+    if (U.tab === 'report' && !U.rep) { await loadReport(); }
+  } catch (e) { msg('bad', e.message); render(); }
+}
+
+function login() {
+  $app.innerHTML = `<div class="bar"><b>Vgram Office</b></div><div class="wrap" style="max-width:420px"><div class="card">
+    <label for="pin">PIN</label><input id="pin" type="password" inputmode="numeric" autocomplete="off"><div style="height:14px"></div>
+    <button class="btn pri wide" id="in">Sign in</button></div>${U.msg ? `<div class="msg ${U.msg.k}">${esc(U.msg.t)}</div>` : ''}<div class="mut" style="text-align:center;margin-top:10px">Vgram Office · v3.4 (2026-11-21)</div></div>`;
+  const go = async () => {
+    U.pin = document.getElementById('pin').value.trim();
+    const btn = document.getElementById('in'); btn.disabled = true; btn.classList.add('busy'); btn.textContent = 'Signing in...';
+    try {
+      // the stock room data call doubles as the PIN check; admins get the same data
+      U.sr = await api({ action: 'stockroom_data' });
+      const role = U.sr.role === 'admin' ? 'admin' : 'stockroom', name = role === 'admin' ? 'Admin' : 'Stock Room';
+      U.role = role; U.name = name; sessionStorage.setItem('vg.pin', U.pin); sessionStorage.setItem('vg.role', role); sessionStorage.setItem('vg.name', name);
+      U.msg = null; U.tab = 'dispatch'; render();
+    } catch (e) { msg('bad', e.message); render(); }
+  };
+  document.getElementById('in').onclick = go;
+  document.getElementById('pin').onkeydown = (e) => { if (e.key === 'Enter') go(); };
+}
+
+/* ---------------------------------------------------------- stock room -- */
+
+function slipHtml(t) {
+  const units = t.lines.reduce((s, l) => s + l.sent, 0);
+  return `<div class="card slip"><div class="row"><div><h3 style="font-size:20px">Packing slip ${esc(t.id)}</h3>
+    <div>From VGRAM DISTRIBUTION to <b>${esc(t.toName)}</b></div><div class="mut">${fmt(t.ts)} · sent by ${esc(t.user)}</div>${t.deliveredBy ? '<div>Delivered by: <b>' + esc(t.deliveredBy) + '</b></div>' : ''}</div>
+    <button class="btn sm noprint" onclick="window.print()">Print</button></div>
+    <table style="margin-top:10px"><thead><tr><th>SKU</th><th>Item</th><th class="num">Qty sent</th><th class="num">Qty received</th></tr></thead><tbody>
+    ${t.lines.map((l) => `<tr><td>${esc(l.sku)}</td><td>${esc(l.name)}</td><td class="num">${l.sent}</td><td class="num">${l.received == null ? '' : l.received}</td></tr>`).join('')}
+    </tbody><tfoot><tr><td></td><td><b>Total</b></td><td class="num"><b>${units}</b></td><td></td></tr></tfoot></table>
+    <div class="row" style="margin-top:30px"><span>Sent by: ____________</span><span>Delivered by: ${t.deliveredBy ? '<b>' + esc(t.deliveredBy) + '</b> ' : ''}____________</span><span>Received by: ____________</span></div></div>`;
+}
+
+function vDispatch() {
+  if (U.slip) return `<div class="msg ok noprint">Dispatched. The stock has left VGRAM DISTRIBUTION; the branch receives it after confirming.</div>${slipHtml(U.slip)}<button class="btn noprint" id="newtrf">New transfer</button>`;
+  if (!U.sr) return '<div class="card">Loading...</div>';
+  const q = U.find.toLowerCase();
+  const items = U.sr.items.filter((i) => !q || (i.name + ' ' + i.sku + ' ' + (i.category || '')).toLowerCase().includes(q)).slice(0, 40);
+  const lines = Object.keys(U.cart).map((s) => { const it = U.sr.items.find((i) => i.sku === s); return { it, v: U.cart[s] }; });
+  const bad = lines.some((l) => !(num(l.v) > 0) || num(l.v) > l.it.available);
+  const can = U.dest && lines.length && !bad && !U.busy;
+  return `<div class="card"><h3>1. Where is it going?</h3><select id="dest"><option value="">Choose a branch</option>${U.sr.branches.map((b) => `<option value="${esc(b.code)}" ${U.dest === b.code ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select>
+    <div style="height:8px"></div><label for="dby">Delivered by (optional)</label><input id="dby" type="text" maxlength="60" placeholder="Driver, courier or staff carrying it" value="${esc(U.deliveredBy || '')}"></div>
+    <div class="card"><h3>2. What is going?</h3><input type="search" id="find" placeholder="Search by name or SKU" value="${esc(U.find)}">
+    <div style="max-height:320px;overflow:auto;margin-top:8px">${items.map((i) => `<div class="item row"><div><b>${esc(i.name)}</b><div class="mut">SKU ${esc(i.sku)} · <span style="${i.available < 20 ? 'color:var(--warn-d);font-weight:600' : ''}">${i.available} available</span></div></div>
+      <button class="btn sm ${U.cart[i.sku] != null ? '' : 'pri'}" data-add="${esc(i.sku)}" ${U.cart[i.sku] != null || i.available <= 0 ? 'disabled' : ''}>${U.cart[i.sku] != null ? 'Added' : 'Add'}</button></div>`).join('') || '<div class="mut">No match.</div>'}</div></div>
+    <div class="card"><h3>3. Check and dispatch</h3>${lines.length ? lines.map((l) => { const n = num(l.v), over = n > l.it.available; return `<div class="item row"><div><b>${esc(l.it.name)}</b><div class="mut" style="${over ? 'color:var(--bad-d);font-weight:600' : ''}">${over ? 'Only ' + l.it.available + ' available' : 'SKU ' + esc(l.it.sku)}</div></div>
+      <div><input class="q" type="number" min="1" inputmode="numeric" data-q="${esc(l.it.sku)}" value="${esc(l.v)}"> <button class="btn sm" data-rm="${esc(l.it.sku)}">Remove</button></div></div>`; }).join('') : '<div class="mut">No items yet.</div>'}
+      <div class="row" style="margin-top:10px"><span>${lines.length} lines</span><b>${lines.reduce((s, l) => s + (num(l.v) > 0 ? num(l.v) : 0), 0)} units</b></div>
+      <div style="height:10px"></div><button class="btn pri wide" id="dispatch" ${can ? '' : 'disabled'}>${U.busy ? 'Dispatching...' : 'Dispatch transfer'}</button>
+      <div class="mut" style="margin-top:6px">${!U.dest ? 'Choose a destination first.' : !lines.length ? 'Add at least one item.' : bad ? 'Fix the quantities marked in red.' : 'The stock leaves VGRAM DISTRIBUTION now.'}</div></div>`;
+}
+
+const TRF_STATUS = ['Dispatched', 'Partly received', 'Received', 'Received with discrepancy', 'Cancelled', 'Closed, balance cancelled'];
+function tfActive() { const f = U.tf; return !!(f && (f.q || f.branch || f.status || f.from || f.to)); }
+function allTransfers() { return U.sr.transfers.concat(U.tf && U.tf.rows ? U.tf.rows : []); }
+async function runTransferSearch(more) {
+  const f = U.tf; if (!f) return;
+  if (!tfActive()) { f.rows = null; f.total = 0; f.more = false; return render(); }
+  f.loading = true; render();
+  try {
+    const r = await api({ action: 'transfers_search', q: f.q, branch: f.branch, status: f.status, from: f.from, to: f.to, offset: more ? (f.rows || []).length : 0 });
+    f.rows = more ? (f.rows || []).concat(r.transfers) : r.transfers; f.total = r.total; f.more = r.hasMore; U.msg = null;
+  } catch (e) { msg('bad', e.message); }
+  f.loading = false; render();
+}
+function trfRow(t) {
+  return `<tr><td>${esc(t.id)}</td><td>${esc(t.toName)}</td><td><span class="pill ${t.status === 'Received' ? 'ok' : t.status === 'Dispatched' ? '' : 'warn'}">${esc(t.status)}</span>${t.deliveredBy ? '<div class="mut">by ' + esc(t.deliveredBy) + '</div>' : ''}</td><td>${fmt(t.ts)}</td><td><button class="btn sm" data-slip="${esc(t.id)}">Packing slip</button>${U.role === 'admin' && (t.status === 'Dispatched' || t.status === 'Partly received') ? ` <button class="btn sm" data-cancel="${esc(t.id)}" ${U.busy ? 'disabled' : ''}>Cancel</button>` : ''}</td></tr>`;
+}
+function vTransfers() {
+  if (U.slip) return slipHtml(U.slip) + '<button class="btn noprint" id="closeslip">Back to list</button>';
+  if (!U.sr) return '<div class="card">Loading...</div>';
+  const f = U.tf = U.tf || { q: '', branch: '', status: '', from: '', to: '' }, act = tfActive();
+  const list = act ? (f.rows || []) : U.sr.transfers;
+  const bar = `<div class="card noprint"><div class="row" style="gap:8px;align-items:flex-end;flex-wrap:wrap">
+    <div><label for="tq">Transfer code</label><input id="tq" type="text" placeholder="e.g. 0003 or 20261117" value="${esc(f.q)}"></div>
+    <div><label for="tb">Branch</label><select id="tb"><option value="">All branches</option>${U.sr.branches.map((b) => `<option value="${esc(b.code)}" ${f.branch === b.code ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select></div>
+    <div><label for="ts">Status</label><select id="ts"><option value="">All statuses</option>${TRF_STATUS.map((x) => `<option ${f.status === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div>
+    <div><label for="tfrom">Sent from</label><input type="date" id="tfrom" value="${esc(f.from)}"></div>
+    <div><label for="tto">Sent to</label><input type="date" id="tto" value="${esc(f.to)}"></div>
+    <div style="display:flex;gap:8px"><button class="btn pri" id="tgo" ${f.loading ? 'disabled' : ''}>Search</button><button class="btn" id="tclear">Clear</button></div></div></div>`;
+  const note = act ? `${f.loading ? 'Searching...' : (f.total ? 'Showing ' + list.length + ' of ' + f.total + ' transfers that match.' : '')}` : 'Showing the latest ' + U.sr.transfers.length + ' transfers. Use the search to find older ones.';
+  return bar + `<div class="card"><h3>${act ? 'Search results' : 'Recent transfers'}</h3><div class="mut" style="margin-bottom:6px">${note}</div><table><thead><tr><th>Transfer</th><th>To</th><th>Status</th><th>Sent</th><th></th></tr></thead><tbody>
+    ${list.map(trfRow).join('') || `<tr><td colspan="5" class="mut">${act ? (f.loading ? 'Searching...' : 'No transfers match. Change or clear the search.') : 'No transfers yet.'}</td></tr>`}</tbody></table>
+    ${act && f.more && !f.loading ? '<div style="margin-top:10px"><button class="btn" id="tmore">Show more</button></div>' : ''}</div>`;
+}
+function vSupplier() {
+  if (!U.sr) return '<div class="card">Loading...</div>';
+  return `<div class="card"><h3>Received from a supplier</h3><div class="mut">Adds stock to VGRAM DISTRIBUTION. Enter the quantities delivered.</div>
+    <div style="height:8px"></div><input type="search" id="sfind" placeholder="Search by name or SKU"><div id="sres" style="max-height:200px;overflow:auto"></div>
+    <div id="sl" style="margin-top:10px"></div><div style="height:8px"></div><label for="sref">Delivery receipt / note (optional)</label><input id="sref" type="text">
+    <div style="height:10px"></div><button class="btn pri wide" id="ssave" ${U.busy ? 'disabled' : ''}>${U.busy ? 'Saving...' : 'Save supplier receipt'}</button></div>`;
+}
+
+/* ----------------------------------------------------------------- admin - */
+
+async function loadReport() {
+  U.busy = true; render();
+  try { U.rep = await api({ action: 'report', date: U.repDate }); U.msg = null; } catch (e) { msg('bad', e.message); }
+  U.busy = false; render();
+}
+
+
+const DIFF_PILL = { 'Open': 'warn', 'Recount requested': 'bad', 'Recounted': 'warn', 'Reviewed': '', 'Approved': 'ok', 'Resolved': 'ok' };
+function diffTable(list, empty) {
+  const sign = (n) => (n > 0 ? '+' : '') + n;
+  return `<table><thead><tr><th>Branch</th><th>Item</th><th class="num">Expected</th><th class="num">Counted</th><th class="num">Diff</th><th>Status</th><th>Reason</th><th>Owner</th><th class="num">Age</th><th class="noprint">Actions</th></tr></thead><tbody>
+    ${list.map((d) => {
+      const exp = d.expected, got = d.kind === 'COUNT' ? d.counted : d.actual;
+      return `<tr><td>${esc(d.branch)}</td><td>${esc(d.name)} <span class="mut">${esc(d.sku)}</span>${d.kind === 'TRANSFER' ? ' <span class="pill">transfer ' + esc(d.ref) + '</span>' : ''}${d.kind === 'MIDDAY' ? ' <span class="pill">mid-day check</span>' : ''}${d.provisional ? ' <span class="pill warn">provisional</span>' : ''}</td>
+      <td class="num">${exp}</td><td class="num">${got}</td><td class="num" style="font-weight:600;color:${d.diff < 0 ? 'var(--bad-d)' : 'var(--warn-d)'}">${sign(d.diff)}</td>
+      <td><span class="pill ${DIFF_PILL[d.status] || ''}">${esc(d.status)}</span></td><td>${esc(d.reason)}${d.note ? '<div class="mut">' + esc(d.note) + '</div>' : ''}</td>
+      <td>${d.owner ? esc(d.owner) : '<span class="mut">none</span>'}</td><td class="num" style="${d.ageDays >= 3 && d.status !== 'Resolved' ? 'color:var(--bad-d);font-weight:600' : ''}">${d.ageDays}d</td>
+      <td class="noprint">${d.status === 'Resolved' ? '<span class="mut">Done</span>' : `<button class="btn sm" data-da="recount" data-id="${esc(d.id)}" ${U.busy ? 'disabled' : ''}>Recount</button> <button class="btn sm" data-da="review" data-id="${esc(d.id)}" ${U.busy ? 'disabled' : ''}>Review</button> <button class="btn sm" data-da="assign" data-id="${esc(d.id)}" ${U.busy ? 'disabled' : ''}>Owner</button>${d.status === 'Reviewed' && d.kind !== 'TRANSFER' ? ` <button class="btn sm pri" data-da="approve" data-id="${esc(d.id)}" ${U.busy ? 'disabled' : ''}>${Math.abs(d.diff) > (U.rep.limit || 0) ? 'Approve (needed)' : 'Approve'}</button>` : ''}${d.kind !== 'COUNT' && (d.status === 'Reviewed' || d.status === 'Approved') ? ` <button class="btn sm pri" data-da="resolve" data-id="${esc(d.id)}" ${U.busy ? 'disabled' : ''}>Resolve</button>` : ''}`}</td></tr>`;
+    }).join('') || `<tr><td colspan="10" class="mut">${empty}</td></tr>`}</tbody></table>`;
+}
+function findDiff(id) { const r = U.rep; return r && r.details.concat(r.transferDiffs || [], r.middayDiffs || [], r.earlierOpen || []).filter((d) => d.id === id)[0]; }
+function vDiffForm(r) {
+  const a = U.act; if (!a) return '';
+  const d = findDiff(a.id); if (!d) return '';
+  if (a.mode === 'assign') return `<div class="card noprint" style="border:2px solid var(--teal)"><h3>Owner: ${esc(d.branch)} ${esc(d.name)} (${d.diff > 0 ? '+' : ''}${d.diff})</h3>
+    <label>Who follows this up?</label><select id="aowner"><option value="">No owner</option>${r.owners.map((x) => `<option ${d.owner === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>
+    <div style="height:10px"></div><div style="display:flex;gap:8px"><button class="btn pri" id="aosave" ${U.busy ? 'disabled' : ''}>Save owner</button><button class="btn" id="acancel">Cancel</button></div></div>`;
+  const list = d.kind === 'TRANSFER' ? r.reasons.receive : r.reasons.count;
+  return `<div class="card noprint" style="border:2px solid var(--teal)"><h3>Review: ${esc(d.branch)} ${esc(d.name)} (${d.diff > 0 ? '+' : ''}${d.diff})</h3>
+    <label>Reason</label><select id="areason"><option value="">Choose a reason</option>${list.map((x) => `<option ${d.reason === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>
+    <div style="height:8px"></div><label>Note (needed if Other)</label><input id="anote" type="text" value="${esc(d.note)}">
+    <div style="height:10px"></div><div style="display:flex;gap:8px"><button class="btn pri" id="asave" ${U.busy ? 'disabled' : ''}>Save review</button><button class="btn" id="acancel">Cancel</button></div></div>`;
+}
+async function runDiff(body, done) {
+  await saving('Saving... please wait', async () => {
+    await api(Object.assign({ action: 'diff_action' }, body));
+    U.rep = await api({ action: 'report', date: U.repDate }); U.act = null; U.msg = null;
+  }, done);
+}
+
+function vReport() {
+  const r = U.rep;
+  const head = `<div class="card noprint"><div class="row"><div><label for="rdate">Day</label><input type="date" id="rdate" value="${esc(U.repDate)}"></div>
+    <div><label for="rbranch">Branch</label><select id="rbranch"><option value="">All branches</option>${r ? r.branches.map((b) => `<option value="${esc(b.code)}" ${U.repBranch === b.code ? 'selected' : ''}>${esc(b.name)}</option>`).join('') : ''}</select></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="rload">Refresh</button><button class="btn pri" id="rclose" ${r && !U.busy ? '' : 'disabled'}>Close day</button></div></div>
+    <div class="mut" style="margin-top:6px">Close day posts a correction for each difference so the system matches the closing count, which is tomorrow's opening stock. Review the differences first. A difference over ${r ? r.limit : 10} units must be approved before it can be posted. Do it after the day's sales file is uploaded.</div></div>`;
+  if (!r) return head + `<div class="card">${U.busy ? 'Loading...' : 'No report yet.'}</div>`;
+  const bc = U.repBranch && r.branches.some((x) => x.code === U.repBranch) ? U.repBranch : '', bsel = r.branches.find((x) => x.code === bc);
+  const OPEN = { 'Open': 1, 'Recount requested': 1, 'Recounted': 1, 'Reviewed': 1, 'Approved': 1 };
+  const by = (l) => (bc ? (l || []).filter((d) => d.branch === bc) : (l || []));
+  const brs = bc ? r.branches.filter((x) => x.code === bc) : r.branches;
+  const dts = by(r.details), earlier = by(r.earlierOpen), tdf = by(r.transferDiffs), mdf = by(r.middayDiffs), att = bc ? r.transfers.filter((t) => t.toCode === bc) : r.transfers;
+  const k = bc ? { counted: brs.filter((x) => x.status === 'Counted' || x.status === 'Opening count').length, total: brs.length, withDifferences: brs.filter((x) => x.differ > 0).length,
+    openDifferences: dts.filter((d) => OPEN[d.status]).length + tdf.filter((d) => OPEN[d.status]).length + mdf.filter((d) => OPEN[d.status]).length + earlier.length,
+    inTransit: att.filter((t) => t.status === 'In transit').length, overdue: att.filter((t) => t.status === 'Overdue').length, salesLoaded: brs.filter((x) => x.salesLoaded).length, middayChecked: brs.filter((x) => x.midday).length } : r.kpi;
+  const sub = bc ? ` <span class="pill">${esc(bsel.name)}</span>` : '';
+  const pill = (s) => `<span class="pill ${s === 'Counted' || s === 'Opening count' ? 'ok' : s === 'Needs opening stock' ? 'warn' : ''}">${esc(s)}</span>`;
+  return head + `<div class="tiles"><div class="tile"><span class="mut">Counts received</span><b>${k.counted} of ${k.total}</b></div>
+    <div class="tile"><span class="mut">Branches with differences</span><b style="color:var(--warn-d)">${k.withDifferences}</b></div>
+    <div class="tile"><span class="mut">Open differences</span><b style="color:${k.openDifferences ? 'var(--bad-d)' : 'inherit'}">${k.openDifferences}</b></div>
+    <div class="tile"><span class="mut">Transfers in transit</span><b>${k.inTransit}</b></div>
+    <div class="tile"><span class="mut">Overdue transfers</span><b style="color:var(--bad-d)">${k.overdue}</b></div>
+    <div class="tile"><span class="mut">Sales files loaded</span><b>${k.salesLoaded} of ${k.total}</b></div>
+    <div class="tile"><span class="mut">Checked mid-day</span><b>${k.middayChecked} of ${k.total}</b></div></div>
+    <div class="card" style="overflow:auto"><h3>Branches${sub}</h3><table><thead><tr><th>Branch</th><th>End count</th><th>Opening from</th><th class="num">Items counted</th><th class="num">Items that differ</th><th class="num">Units short</th><th class="num">Units over</th><th>Sales loaded</th><th class="num">Transfers open</th><th>Mid-day check</th><th>Last sync</th></tr></thead><tbody>
+    ${brs.map((b) => `<tr><td><b>${esc(b.name)}</b></td><td>${pill(b.status)}</td><td>${b.openingFrom ? esc(b.openingFrom) + '<div class="mut">' + esc(b.openingSource) + '</div>' : '<span class="mut">-</span>'}</td><td class="num">${b.counted || '-'}</td><td class="num" style="${b.differ ? 'color:var(--bad-d);font-weight:600' : ''}">${b.counted ? b.differ : '-'}</td><td class="num">${b.counted ? b.short : '-'}</td><td class="num">${b.counted ? b.over : '-'}</td><td>${b.salesLoaded ? 'Yes' : '<span class="mut">No</span>'}</td><td class="num">${b.open}</td><td>${b.midday ? `<span class="pill ${b.midday.differ ? 'bad' : 'ok'}">${b.midday.differ ? b.midday.differ + ' differ' : 'Matched'}</span><div class="mut">${b.midday.items} item(s)${b.midday.differ ? ', ' + b.midday.short + ' short, ' + b.midday.over + ' over' : ''} · ${esc(b.midday.by)} ${fmt(b.midday.last)}</div>` : '<span class="mut">Not checked</span>'}</td><td>${fmt(b.lastSync)}</td></tr>`).join('')}</tbody></table></div>
+    ${vDiffForm(r)}
+    <div class="card" style="overflow:auto"><h3>Count differences for ${esc(r.date)}${sub}</h3>${dts.some((d) => d.provisional) ? '<div class="mut">Rows marked provisional have no sales file loaded for that branch yet, so the difference is not reliable.</div>' : ''}
+    ${diffTable(dts.slice().sort((a, b) => a.diff - b.diff), 'No differences.')}</div>
+    ${earlier.length ? `<div class="card" style="overflow:auto;border:2px solid var(--bad-d)"><h3>Still open from earlier days</h3><div class="mut">These were not settled on their own day.</div>${diffTable(earlier, '')}</div>` : ''}
+    <div class="card" style="overflow:auto"><h3>Transfer differences${sub}</h3><div class="mut">Quantities received that did not match the packing slip. The branch gave the first reason.</div>
+    ${diffTable(tdf, 'No transfer differences.')}</div>
+    <div class="card" style="overflow:auto"><h3>Mid-day check differences${sub}</h3><div class="mut">Found by the checker during the day: counted compared with opening + received - sold.</div>
+    ${diffTable(mdf, 'No mid-day differences.')}</div>
+    <div class="card" style="overflow:auto"><h3>Transfers that need attention${sub}</h3><table><thead><tr><th>Transfer</th><th>To</th><th>Status</th><th>Detail</th></tr></thead><tbody>
+    ${att.map((t) => `<tr><td>${esc(t.id)}</td><td>${esc(t.to)}</td><td><span class="pill ${t.status === 'Overdue' ? 'bad' : t.status === 'Difference' ? 'warn' : ''}">${esc(t.status)}</span></td><td>${esc(t.detail)}</td></tr>`).join('') || '<tr><td colspan="4" class="mut">Nothing needs attention.</td></tr>'}</tbody></table></div>`;
+}
+
+/* CSV reading: handles quotes, commas inside quotes and a BOM. */
+function parseCsv(text) {
+  const rows = []; let row = [], cur = '', q = false;
+  text = text.replace(/^﻿/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+    else if (c === '"') q = true;
+    else if (c === ',') { row.push(cur); cur = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cur); rows.push(row); row = []; cur = ''; }
+    else cur += c;
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  return rows.filter((r) => r.some((x) => x.trim() !== ''));
+}
+
+function guess(headers, re) { const i = headers.findIndex((h) => re.test(h)); return i < 0 ? '' : String(i); }
+
+function vSales() {
+  const s = U.sales;
+  const up = `<div class="card"><h3>Daily POS sales (all branches)</h3><div class="mut">Upload the sales-by-item file exported from the POS. Choose the day it covers. A day and branch that is already posted is skipped unless you tick Replace.</div>
+    <div style="height:8px"></div><div class="row" style="align-items:flex-end;flex-wrap:wrap"><div><label for="sdate">Sales date</label><input type="date" id="sdate" value="${esc(s ? s.date : todayMNL())}"></div>
+    <div><label for="sfile">File (.csv)</label><input type="file" id="sfile" accept=".csv,text/csv"></div></div></div>`;
+  if (!s) return up;
+  const h = s.rows[0];
+  const opt = (sel) => '<option value="">-</option>' + h.map((x, i) => `<option value="${i}" ${String(sel) === String(i) ? 'selected' : ''}>${esc(x)}</option>`).join('');
+  const prev = salesRows();
+  return up + `<div class="card"><h3>Check the columns</h3>
+    <label><input type="radio" name="mode" value="col" ${s.mode === 'col' ? 'checked' : ''}> One column holds the branch name</label>
+    <label><input type="radio" name="mode" value="multi" ${s.mode === 'multi' ? 'checked' : ''}> Each branch has its own column of quantities</label>
+    <div style="height:8px"></div>
+    <div class="row" style="flex-wrap:wrap;align-items:flex-end"><div style="flex:1;min-width:180px"><label>SKU column</label><select id="csku">${opt(s.sku)}</select></div>
+    ${s.mode === 'col' ? `<div style="flex:1;min-width:180px"><label>Branch column</label><select id="cbr">${opt(s.br)}</select></div><div style="flex:1;min-width:180px"><label>Quantity sold column</label><select id="cqty">${opt(s.qty)}</select></div>`
+      : '<div class="mut" style="flex:2">Columns whose title contains a branch code or name (like "Sold [V1 - Parian branch]") are used.</div>'}</div></div>
+    <div class="card"><h3>Preview</h3><div class="mut">${prev.length} sales lines found${s.name ? ' in ' + esc(s.name) : ''}.</div>
+    <table><thead><tr><th>Branch</th><th>SKU</th><th class="num">Qty</th></tr></thead><tbody>${prev.slice(0, 8).map((r) => `<tr><td>${esc(r.branch)}</td><td>${esc(r.sku)}</td><td class="num">${r.qty}</td></tr>`).join('')}</tbody></table>
+    <div style="height:10px"></div><label><input type="checkbox" id="replace"> Replace branches already posted for this date</label>
+    <div style="height:10px"></div><button class="btn pri wide" id="post" ${prev.length && !U.busy ? '' : 'disabled'}>${U.busy ? 'Posting...' : 'Post sales'}</button></div>`;
+}
+
+function salesRows() {
+  const s = U.sales, h = s.rows[0], out = [];
+  if (s.sku === '') return out;
+  for (let i = 1; i < s.rows.length; i++) {
+    const r = s.rows[i];
+    if (s.mode === 'col') { if (s.br === '' || s.qty === '') return []; const q = num(r[s.qty]); if (q) out.push({ branch: r[s.br], sku: r[s.sku], qty: q }); }
+    else h.forEach((name, j) => {
+      if (j == s.sku) return;
+      const m = name.match(/\[(.*)\]/); const label = m ? m[1] : name;
+      if (!/^(VG?\d+\b|VGRAM)/i.test(label.trim())) return;
+      const q = num(r[j]); if (q) out.push({ branch: label.trim(), sku: r[s.sku], qty: q });
+    });
+  }
+  return out;
+}
+
+function vOpening() {
+  if (!U.sr) return '<div class="card">Loading...</div>';
+  const bs = [{ code: 'DIST', name: 'VGRAM DISTRIBUTION' }].concat(U.sr.branches);
+  return `<div class="card"><h3>Opening stock</h3><div class="mut">Sets the starting stock for a place from a file with two columns: sku, qty. Load it once for VGRAM DISTRIBUTION and for every branch before it starts. Branches no longer do a first count: this file is their starting stock, and from then on each day's closing count carries it forward. Choose the day before the first movement you want counted.</div>
+    <div style="height:8px"></div><div class="row" style="flex-wrap:wrap;align-items:flex-end"><div style="flex:1;min-width:200px"><label>Place</label><select id="obr">${bs.map((b) => `<option value="${esc(b.code)}" ${U.obr === b.code ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select></div>
+    <div><label>Opening date</label><input type="date" id="odate" max="${todayMNL()}" value="${esc(U.odate || new Date(Date.now() - 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' }))}"></div>
+    <div><label>File (.csv)</label><input type="file" id="ofile" accept=".csv"></div></div>
+    <div id="oprev" class="mut" style="margin-top:8px"></div><div style="height:10px"></div><button class="btn pri wide" id="opost" disabled>Post opening stock</button></div>`;
+}
+
+function vStock() {
+  if (!U.sr) return '<div class="card">Loading...</div>';
+  const bs = [{ code: 'DIST', name: 'VGRAM DISTRIBUTION' }].concat(U.sr.branches);
+  return `<div class="card"><h3>Stock lookup</h3><div class="row" style="align-items:flex-end"><div style="flex:1"><label>Place</label><select id="skbr">${bs.map((b) => `<option value="${esc(b.code)}" ${U.skbr === b.code ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select></div><button class="btn" id="skgo" ${U.busy ? 'disabled' : ''}>Show</button></div></div>
+    ${U.stockRows ? `<div class="card"><div class="row" style="align-items:flex-end;margin-bottom:8px"><div style="flex:1"><label for="skq">Search item name or SKU</label><input id="skq" type="search" placeholder="e.g. vista or 10141" value="${esc(U.skq || '')}" autocomplete="off"></div><button class="btn" id="skclear">Clear</button></div>
+      <div class="mut" id="skcount" style="margin-bottom:6px"></div>
+      <table><thead><tr><th>SKU</th><th>Item</th><th class="num">On hand</th></tr></thead><tbody id="skbody">${U.stockRows.map((r) => `<tr data-n="${esc((r.sku + ' ' + r.name).toLowerCase())}"><td>${esc(r.sku)}</td><td>${esc(r.name)}</td><td class="num" style="${r.qty < 0 ? 'color:var(--bad-d);font-weight:600' : ''}">${r.qty}</td></tr>`).join('') || '<tr><td colspan="3" class="mut">No stock recorded yet.</td></tr>'}<tr id="sknone" class="hide"><td colspan="3" class="mut">No item matches. Check the spelling or clear the search.</td></tr></tbody></table></div>` : ''}`;
+}
+
+/* ----------------------------------------------------------- behaviour -- */
+
+function bind() {
+  const on = (id, fn) => { const e = document.getElementById(id); if (e) e.onclick = fn; };
+  on('newtrf', () => { U.slip = null; U.cart = {}; U.dest = ''; U.deliveredBy = ''; U.msg = null; render(); });
+  on('closeslip', () => { U.slip = null; render(); });
+  const rb = document.getElementById('rbranch'); if (rb) rb.onchange = () => { U.repBranch = rb.value; render(); };
+  const dby = document.getElementById('dby'); if (dby) dby.oninput = () => { U.deliveredBy = dby.value; };
+  const d = document.getElementById('dest'); if (d) d.onchange = () => { U.dest = d.value; render(); };
+  const f = document.getElementById('find'); if (f) f.oninput = () => { U.find = f.value; const p = f.selectionStart; render(); const nf = document.getElementById('find'); nf.focus(); nf.setSelectionRange(p, p); };
+  document.querySelectorAll('[data-add]').forEach((b) => b.onclick = () => { const it = U.sr.items.find((i) => i.sku === b.dataset.add); U.cart[it.sku] = String(Math.min(10, it.available)); render(); });
+  document.querySelectorAll('[data-rm]').forEach((b) => b.onclick = () => { delete U.cart[b.dataset.rm]; render(); });
+  document.querySelectorAll('[data-q]').forEach((i) => i.onchange = () => { U.cart[i.dataset.q] = i.value; render(); });
+  on('dispatch', () => saving('Dispatching... please wait, do not close this page', async () => {
+    const r = await api({ action: 'dispatch', id: U.cartId || (U.cartId = uuid()), dest: U.dest, deliveredBy: U.deliveredBy || '', lines: Object.keys(U.cart).map((s) => ({ sku: s, qty: num(U.cart[s]) })) });
+    if (r.sr) U.sr = r.sr; else U.sr = await api({ action: 'stockroom_data' });
+    if (r.duplicate || !r.transfer) { U.cart = {}; U.dest = ''; U.cartId = null; msg('ok', 'This transfer was already saved. See the Transfers tab.'); return { id: '' }; }
+    U.slip = Object.assign({}, r.transfer, { lines: r.transfer.lines.map((l) => Object.assign({ received: null }, l)) }); U.cart = {}; U.dest = ''; U.deliveredBy = ''; U.cartId = null; U.msg = null;
+    return r.transfer;
+  }, (t) => t.id ? 'Dispatched ' + t.id + '. Packing slip is ready.' : 'Already saved.'));
+  document.querySelectorAll('[data-cancel]').forEach((b) => b.onclick = () => {
+    const id = b.dataset.cancel, why = prompt('Cancel transfer ' + id + '?\nWhat was not received goes back to VGRAM DISTRIBUTION.\n\nWhy is it being cancelled?');
+    if (why === null) return;
+    if (!why.trim()) { msg('bad', 'Give a reason to cancel the transfer.'); return render(); }
+    saving('Cancelling... please wait', async () => {
+      const r = await api({ action: 'cancel_transfer', id, reason: why.trim() });
+      U.sr = r.sr; U.msg = null; if (tfActive()) await runTransferSearch(false); msg('ok', 'Transfer ' + id + ' cancelled. ' + r.returned + ' line(s) returned to VGRAM DISTRIBUTION.');
+    }, 'Transfer cancelled. Stock returned to the stock room.');
+  });
+  const tf = U.tf;
+  if (tf && document.getElementById('tgo')) {
+    const go = () => { tf.q = document.getElementById('tq').value.trim(); tf.branch = document.getElementById('tb').value; tf.status = document.getElementById('ts').value; tf.from = document.getElementById('tfrom').value; tf.to = document.getElementById('tto').value; runTransferSearch(false); };
+    on('tgo', go); on('tmore', () => runTransferSearch(true));
+    on('tclear', () => { U.tf = { q: '', branch: '', status: '', from: '', to: '' }; render(); });
+    document.getElementById('tq').onkeydown = (e) => { if (e.key === 'Enter') go(); };
+    ['tb', 'ts', 'tfrom', 'tto'].forEach((i) => document.getElementById(i).onchange = go);
+  }
+  document.querySelectorAll('[data-slip]').forEach((b) => b.onclick = () => { const t = allTransfers().find((x) => x.id === b.dataset.slip); U.slip = { id: t.id, toName: t.toName, ts: t.ts, user: t.user, deliveredBy: t.deliveredBy, lines: t.lines }; render(); });
+  supplierBind();
+  document.querySelectorAll('[data-da]').forEach((b) => b.onclick = () => {
+    if (b.dataset.da === 'recount') return runDiff({ id: b.dataset.id, do: 'recount' }, 'Recount requested.');
+    if (b.dataset.da === 'approve') return runDiff({ id: b.dataset.id, do: 'approve' }, 'Approved. Close day can now post it.');
+    if (b.dataset.da === 'resolve') return runDiff({ id: b.dataset.id, do: 'resolve' }, 'Marked resolved.');
+    U.act = { id: b.dataset.id, mode: b.dataset.da }; render(); const f = document.getElementById('areason'); if (f) f.scrollIntoView({ block: 'center' });
+  });
+  on('aosave', () => runDiff({ id: U.act.id, do: 'assign', owner: document.getElementById('aowner').value }, 'Owner saved.'));
+  on('acancel', () => { U.act = null; render(); });
+  on('asave', () => runDiff({ id: U.act.id, do: 'review', reason: document.getElementById('areason').value, note: document.getElementById('anote').value }, 'Review saved.'));
+  on('rload', () => { U.repDate = document.getElementById('rdate').value || todayMNL(); loadReport(); });
+  on('rclose', async () => {
+    const date = document.getElementById('rdate').value;
+    if (!confirm('Close ' + date + '? Each difference becomes a correction entry so the system matches the closing count.')) return;
+    const list = (x) => x.slice(0, 12).map((i) => i.branch + ' ' + i.name + ' (' + (i.diff > 0 ? '+' : '') + i.diff + ')').join('\n') + (x.length > 12 ? '\n... and ' + (x.length - 12) + ' more' : '');
+    await saving('Closing the day... please wait', async () => {
+      // Close day may ask to confirm differences nobody has reviewed, or branches with no sales file. Nothing posts until confirmed.
+      let extra = {}, r, cancelled = false;
+      for (let step = 0; step < 4; step++) {
+        r = await api(Object.assign({ action: 'close_day', date }, extra));
+        if (r.needsConfirm) {
+          toast('ok', 'Waiting for your confirmation...');
+          if (!confirm(r.unreviewed.length + ' difference(s) have not been reviewed:\n\n' + list(r.unreviewed) + '\n\nPost them anyway? Choose Cancel to go back and review them first.')) { cancelled = true; break; }
+          extra.confirmUnreviewed = true; toast('work', 'Closing the day... please wait'); continue;
+        }
+        if (r.skippedBranches.length && !extra.force) {
+          toast('ok', 'Waiting for your confirmation...');
+          if (confirm('No sales file for: ' + r.skippedBranches.join(', ') + '. Close those branches anyway? Their differences will include unposted sales.')) { extra.force = true; toast('work', 'Closing the day... please wait'); continue; }
+        }
+        break;
+      }
+      U.repDate = date; U.rep = await api({ action: 'report', date });
+      if (cancelled) { msg('warn', 'Nothing was posted. Review the differences, then close the day.'); return { cancelled: true }; }
+      const parts = ['Day closed. ' + r.adjustments + ' correction(s) posted.'];
+      if (r.postedWithoutReview) parts.push(r.postedWithoutReview + ' were posted without review.');
+      if (r.held && r.held.length) parts.push(r.held.length + ' held because they are over ' + U.rep.limit + ' units and need approval: ' + list(r.held).replace(/\n/g, '; ') + '.');
+      if (r.skippedBranches.length) parts.push('Skipped (no sales file): ' + r.skippedBranches.join(', ') + '.');
+      msg(r.held && r.held.length ? 'warn' : 'ok', parts.join(' '));
+      return r;
+    }, (r) => r.cancelled ? 'Cancelled. Nothing was posted.' : 'Day closed. ' + r.adjustments + ' correction(s) posted.' + (r.held && r.held.length ? ' ' + r.held.length + ' held for approval.' : ''));
+  });
+  salesBind(); openingBind();
+  const skq = document.getElementById('skq');
+  if (skq) {
+    const apply = () => {
+      U.skq = skq.value; const words = skq.value.trim().toLowerCase().split(/\s+/).filter(Boolean); let shown = 0, total = 0;
+      document.querySelectorAll('#skbody tr[data-n]').forEach((r) => { total++; const ok = words.every((w) => r.dataset.n.indexOf(w) >= 0); r.classList.toggle('hide', !ok); if (ok) shown++; });
+      document.getElementById('skcount').textContent = words.length ? shown + ' of ' + total + ' items match' : total + ' items';
+      document.getElementById('sknone').classList.toggle('hide', !(words.length && !shown));
+    };
+    skq.oninput = apply; apply();
+    on('skclear', () => { skq.value = ''; apply(); skq.focus(); });
+  }
+  on('skgo', async () => { const br = document.getElementById('skbr').value; U.skbr = br; U.skq = ''; await saving('Loading stock...', async () => { U.stockRows = (await api({ action: 'stock', branch: br })).items; U.msg = null; }, 'Stock loaded.'); });
+}
+
+function supplierBind() {
+  const find = document.getElementById('sfind'); if (!find) return;
+  const lines = {};
+  const draw = () => {
+    document.getElementById('sl').innerHTML = Object.keys(lines).map((s) => { const it = U.sr.items.find((i) => i.sku === s); return `<div class="item row"><span>${esc(it.name)} <span class="mut">${esc(s)}</span></span><span><input class="q" type="number" min="1" data-sq="${esc(s)}" value="${esc(lines[s])}"> <button class="btn sm" data-sx="${esc(s)}">Remove</button></span></div>`; }).join('');
+    document.querySelectorAll('[data-sq]').forEach((i) => i.oninput = () => { lines[i.dataset.sq] = i.value; });
+    document.querySelectorAll('[data-sx]').forEach((b) => b.onclick = () => { delete lines[b.dataset.sx]; draw(); });
+  };
+  find.oninput = () => {
+    const q = find.value.toLowerCase().trim();
+    document.getElementById('sres').innerHTML = q ? U.sr.items.filter((i) => (i.name + ' ' + i.sku).toLowerCase().includes(q)).slice(0, 8).map((i) => `<div class="item row"><span>${esc(i.name)} <span class="mut">${esc(i.sku)}</span></span><button class="btn sm pri" data-sa="${esc(i.sku)}">Add</button></div>`).join('') : '';
+    document.querySelectorAll('[data-sa]').forEach((b) => b.onclick = () => { lines[b.dataset.sa] = lines[b.dataset.sa] || '1'; draw(); });
+  };
+  document.getElementById('ssave').onclick = async () => {
+    const ls = Object.keys(lines).map((s) => ({ sku: s, qty: num(lines[s]) })).filter((l) => l.qty > 0);
+    if (!ls.length) { msg('bad', 'Add at least one item.'); return render(); }
+    const ref = document.getElementById('sref').value;
+    await saving('Saving supplier receipt... please wait', async () => {
+      const r = await api({ action: 'supplier_receipt', id: U.supId || (U.supId = uuid()), lines: ls, ref });
+      U.sr = r.sr ? r.sr : await api({ action: 'stockroom_data' });
+      U.supId = null; U.msg = null; msg('ok', 'Saved. VGRAM DISTRIBUTION stock updated.');
+    }, 'Supplier receipt saved. Stock room stock updated.');
+  };
+}
+
+function salesBind() {
+  const file = document.getElementById('sfile');
+  if (file) file.onchange = async () => {
+    const f = file.files[0]; if (!f) return;
+    const rows = parseCsv(await f.text());
+    if (rows.length < 2) { msg('bad', 'The file looks empty.'); return render(); }
+    const h = rows[0];
+    const multi = h.filter((x) => /\[(VG?\d+|VGRAM)/i.test(x)).length >= 2;
+    U.sales = { rows, name: f.name, date: document.getElementById('sdate').value, mode: multi ? 'multi' : 'col', sku: guess(h, /sku/i), br: guess(h, /branch|store|outlet|^pos$/i), qty: guess(h, /^(qty|quantity|sold|items sold|quantity sold)/i) };
+    U.msg = null; render();
+  };
+  const sd = document.getElementById('sdate'); if (sd && U.sales) sd.onchange = () => { U.sales.date = sd.value; };
+  document.querySelectorAll('[name=mode]').forEach((r) => r.onchange = () => { U.sales.mode = r.value; render(); });
+  [['csku', 'sku'], ['cbr', 'br'], ['cqty', 'qty']].forEach(([id, k]) => { const e = document.getElementById(id); if (e) e.onchange = () => { U.sales[k] = e.value; render(); }; });
+  const post = document.getElementById('post');
+  if (post) post.onclick = async () => {
+    // read the tick box BEFORE saving() redraws the page (a redraw puts it back to unticked)
+    const replace = !!(document.getElementById('replace') && document.getElementById('replace').checked);
+    await saving('Posting sales... please wait', async () => {
+      const rows = salesRows(), fileDates = salesFileDates();
+      let r = await api({ action: 'upload_sales', date: U.sales.date, rows, replace, fileDates });
+      if (r.needsConfirm) {
+        if (!confirm('Check before posting:\n\n- ' + r.warnings.map((w) => w.text).join('\n- ') + '\n\nPost anyway?')) { msg('warn', 'Not posted. Choose the right file or date and try again.'); return { posted: [], skipped: [], replaced: [], unmatchedBranches: [], unknownSkus: [], cancelled: true }; }
+        r = await api({ action: 'upload_sales', date: U.sales.date, rows, replace, fileDates, confirm: true });
+      }
+      if (r.cancelled) return r;
+      const parts = [`Posted ${r.posted.length} branch(es).`];
+      if (r.skipped.length) parts.push('Already posted, skipped: ' + r.skipped.join(', ') + '.');
+      if (r.replaced.length) parts.push('Replaced: ' + r.replaced.join(', ') + '.');
+      if (r.unmatchedBranches.length) parts.push('Branch not recognised: ' + r.unmatchedBranches.join(', ') + '.');
+      if (r.unknownSkus.length) parts.push(r.unknownSkus.length + ' unknown SKU(s): ' + r.unknownSkus.slice(0, 8).join(', ') + '.');
+      msg(r.unmatchedBranches.length || r.unknownSkus.length || r.skipped.length ? 'warn' : 'ok', parts.join(' ')); U.sales = null;
+      return r;
+    }, (r) => r.cancelled ? 'Not posted.' : 'Sales posted for ' + r.posted.length + ' branch(es).');
+  };
+}
+
+/** Dates found in a Date column of the sales file (ISO or written months only, never guessed day/month). */
+function salesFileDates() {
+  const S = U.sales; if (!S || !S.rows.length) return [];
+  const i = S.rows[0].findIndex((x) => /date/i.test(x)); if (i < 0) return [];
+  const set = {};
+  S.rows.slice(1).forEach((r) => {
+    const v = String(r[i] || '').trim(); if (!v) return;
+    let d = /^\d{4}-\d{2}-\d{2}/.test(v) ? v.slice(0, 10) : (/[A-Za-z]{3}/.test(v) && !isNaN(Date.parse(v + ' UTC')) ? new Date(v + ' UTC').toISOString().slice(0, 10) : '');
+    if (d) set[d] = 1;
+  });
+  return Object.keys(set);
+}
+
+function openingBind() {
+  const file = document.getElementById('ofile'); if (!file) return;
+  let rows = [];
+  file.onchange = async () => {
+    const t = parseCsv(await file.files[0].text()); const h = t[0].map((x) => x.trim().toLowerCase());
+    const si = h.indexOf('sku'), qi = h.indexOf('qty');
+    if (si < 0 || qi < 0) { document.getElementById('oprev').textContent = 'The file needs columns named sku and qty.'; return; }
+    rows = t.slice(1).map((r) => ({ sku: r[si].trim(), qty: num(r[qi]) })).filter((r) => r.sku);
+    document.getElementById('oprev').textContent = rows.length + ' rows ready.'; document.getElementById('opost').disabled = !rows.length;
+  };
+  document.getElementById('obr').onchange = (e) => { U.obr = e.target.value; };
+  document.getElementById('odate').onchange = (e) => { U.odate = e.target.value; };
+  document.getElementById('opost').onclick = async () => {
+    const branch = document.getElementById('obr').value, date = document.getElementById('odate').value;
+    await saving('Posting opening stock... please wait', async () => {
+      let r = await api({ action: 'opening_stock', branch, date, rows });
+      if (r.needsConfirm) {
+        toast('ok', 'Waiting for your confirmation...');
+        if (!confirm(branch + ' already has stock from ' + r.existingDate + '.\n\nPosting this file dated ' + date + ' makes it the new starting point for ' + branch + '. Stock before ' + date + ' is no longer used.\n\nPost it?')) { msg('warn', 'Not posted. The existing stock was kept.'); return { cancelled: true }; }
+        toast('work', 'Posting opening stock... please wait');
+        r = await api({ action: 'opening_stock', branch, date, rows, confirm: true });
+      }
+      if (r.sr) U.sr = r.sr; else if (branch === 'DIST') U.sr = await api({ action: 'stockroom_data' });
+      U.msg = null; msg('ok', 'Opening stock posted: ' + r.items + ' items.');
+      return r;
+    }, (r) => r.cancelled ? 'Cancelled. Nothing was posted.' : 'Opening stock posted: ' + r.items + ' items.');
+  };
+}
+
+render();
+</script>
+</body>
+</html>

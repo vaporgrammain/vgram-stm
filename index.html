@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0B5D5B">
+<title>Vgram Branch</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg">
+<link rel="stylesheet" href="common.css">
+<script src="config.js"></script>
+</head>
+<body>
+<div class="topbar" id="topbar"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div id="app"></div>
+<script>
+/* Branch app. Works with no signal all shift: every entry is saved on this phone and
+   sent in one Sync at the end of the shift. The phone never holds a count target. */
+'use strict';
+const KEY = 'vgram.branch.v1';
+const $app = document.getElementById('app');
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+const manilaDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+const fmtTime = (d) => d ? new Date(d).toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'never';
+
+function load() { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } }
+let S = load();
+S.queue = S.queue || []; S.log = S.log || []; S.draft = S.draft || {};
+function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { alert('This phone is out of storage space. Sync now and free up space.'); } }
+
+const DEFAULT_REASONS = ['Short delivery', 'Over delivery', 'Damaged in transit', 'Wrong item sent', 'Packing slip was wrong', 'Other'];
+const U = { user: null, tab: 'home', view: null, msg: null, busy: false, syncMsg: null };
+
+async function sha256(s) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+let inflight = 0, toastTimer = null;
+function bar(d) { inflight = Math.max(0, inflight + d); document.getElementById('topbar').classList.toggle('on', inflight > 0); }
+function toast(kind, text, ms) {
+  const t = document.getElementById('toast'); clearTimeout(toastTimer);
+  if (!kind) { t.className = 'toast'; return; }
+  t.className = 'toast show ' + kind;
+  t.innerHTML = (kind === 'work' ? '<span class="spin"></span>' : kind === 'ok' ? '<span>&#10003;</span>' : '<span>!</span>') + '<span>' + esc(text) + '</span>';
+  if (ms) toastTimer = setTimeout(() => { t.className = 'toast'; }, ms);
+}
+async function api(body) {
+  bar(1);
+  try { return await api_(body); } finally { bar(-1); }
+}
+async function api_(body) {
+  const url = window.VGRAM_API;
+  if (!url || url.indexOf('http') !== 0) throw new Error('The app address is not set yet. Ask the admin.');
+  let res;
+  try { res = await fetch(url, { method: 'POST', body: JSON.stringify(body) }); }
+  catch (e) { throw new Error('No connection yet. Connect to the office Wi-Fi or a pocket wifi and try again. Your entries are safe on this phone.'); }
+  let j;
+  try { j = await res.json(); } catch (e) { throw new Error('The server did not answer properly. Try again in a moment.'); }
+  if (!j.ok) throw new Error(j.error || 'Something went wrong.');
+  return j;
+}
+
+/* ----------------------------------------------------------------- views */
+
+function render() {
+  if (!S.cfg) return renderSetup();
+  if (!U.user) return renderLogin();
+  const t = U.tab;
+  const body = t === 'home' ? vHome() : t === 'receive' ? vReceive() : t === 'count' ? vCount() : t === 'stock' ? vStock() : vSync();
+  const pending = S.queue.length;
+  $app.innerHTML = `
+    <div class="bar"><div><b>${esc(S.pkg.branch.name)}</b><small>Signed in: ${esc(U.user)}</small></div><button class="btn sm" id="logout">Sign out</button></div>
+    <div class="wrap" style="padding-bottom:90px">${U.msg ? `<div class="msg ${U.msg.k}">${esc(U.msg.t)}</div>` : ''}${body}</div>
+    <div class="tabs">${[['home', 'Home'], ['receive', 'Receive'], ['count', 'Count'], ['stock', 'Stock'], ['sync', 'Sync' + (pending ? ' (' + pending + ')' : '')]]
+      .map(([k, n]) => `<button data-tab="${k}" class="${t === k ? 'on' : ''}">${n}</button>`).join('')}</div>`;
+  bind();
+}
+
+function renderSetup() {
+  $app.innerHTML = `<div class="bar"><b>Set up this phone</b></div><div class="wrap">
+    <div class="card"><p class="mut">Do this once, with internet (office Wi-Fi or pocket wifi). After that the app works with no signal.</p>
+    <label for="sb">Branch code</label><input id="sb" type="text" placeholder="for example V1" autocapitalize="characters">
+    <div style="height:10px"></div><label for="sk">Device key</label><input id="sk" type="password" placeholder="given by the admin">
+    <div style="height:14px"></div><button class="btn pri wide" id="go">Connect</button></div>
+    ${U.msg ? `<div class="msg ${U.msg.k}">${esc(U.msg.t)}</div>` : ''}</div>`;
+  document.getElementById('go').onclick = async (ev) => {
+    const branch = document.getElementById('sb').value.trim().toUpperCase(), key = document.getElementById('sk').value.trim();
+    ev.target.disabled = true; ev.target.classList.add('busy'); ev.target.textContent = 'Connecting...'; toast('work', 'Connecting to the office... please wait');
+    try {
+      const r = await api({ action: 'sync', branch, key, entries: [] });
+      S = { cfg: { branch, key }, pkg: r.data, queue: [], log: [], draft: {}, lastSync: r.serverTime }; save(); U.msg = null; toast('ok', 'Connected. Branch data loaded.', 4000); render();
+    } catch (e) { U.msg = { k: 'bad', t: e.message }; toast('bad', e.message, 7000); render(); }
+  };
+}
+
+function renderLogin() {
+  $app.innerHTML = `<div class="bar"><div><b>${esc(S.pkg.branch.name)}</b><small>Enter your PIN</small></div></div><div class="wrap">
+    <div class="card"><label for="pin">PIN</label><input id="pin" type="password" inputmode="numeric" autocomplete="off">
+    <div style="height:14px"></div><button class="btn pri wide" id="in">Sign in</button></div>
+    ${U.msg ? `<div class="msg ${U.msg.k}">${esc(U.msg.t)}</div>` : ''}</div>`;
+  const go = async () => {
+    const pin = document.getElementById('pin').value.trim();
+    const h = await sha256(S.cfg.key + ':' + pin);
+    const u = (S.pkg.users || []).find((x) => x.hash === h);
+    if (!u) { U.msg = { k: 'bad', t: 'PIN not recognised.' }; return render(); }
+    U.user = u.name; U.msg = null; U.tab = 'home'; render();
+  };
+  document.getElementById('in').onclick = go;
+  document.getElementById('pin').onkeydown = (e) => { if (e.key === 'Enter') go(); };
+}
+
+/** Recount requests from the office that this phone has not answered yet (an unsent count that includes the item answers it). */
+const pendingRecounts = () => ((S.pkg && S.pkg.recounts) || []).filter((r) => !S.queue.some((e) => e.type === 'count' && e.counts.some((c) => c.sku === r.sku)));
+const recountCard = () => {
+  const rc = pendingRecounts(); if (!rc.length) return '';
+  return `<div class="msg bad"><b>The office asks you to recount ${rc.length} item(s).</b><div style="margin-top:4px">${rc.map((r) => esc(r.name) + (r.note ? ' <span class="mut">(' + esc(r.note) + ')</span>' : '')).join('<br>')}</div>
+    <div style="height:8px"></div><button class="btn pri" id="dorecount">Recount now</button></div>`;
+};
+const todayCount = () => S.queue.filter((e) => e.type === 'count' && !e.recount && manilaDate(e.ts) === manilaDate(Date.now())).slice(-1)[0] ||
+  S.log.filter((e) => e.type === 'count' && !e.recount && manilaDate(e.ts) === manilaDate(Date.now())).slice(-1)[0];
+
+function vHome() {
+  const inc = S.pkg.transfers.filter((t) => !S.queue.some((e) => e.type === 'receive' && e.transfer === t.id));
+  const tc = todayCount();
+  return `
+    ${recountCard()}
+    ${S.pkg.needsBaseline ? '<div class="msg warn"><b>No opening stock loaded yet.</b> Tell the admin. Until it is loaded, your end of shift count becomes the starting stock for this branch.</div>' : ''}
+    <div class="card"><div class="row"><h3>Transfers to receive</h3><span class="pill ${inc.length ? 'warn' : 'ok'}">${inc.length}</span></div>
+      <div class="mut">${inc.length ? 'Open Receive when the boxes arrive and check them against the packing slip.' : 'Nothing waiting.'}</div></div>
+    ${S.queue.filter((e) => e.type === 'receive' && (e.lines || []).some((l) => !l.pending && l.sent != null && l.received !== l.sent)).length ? '<div class="msg warn"><b>Receipt with differences.</b> One or more receipts do not match the packing slip. See the Receive tab.</div>' : ''}
+    <div class="card"><div class="row"><h3>End of shift count</h3><span class="pill ${tc ? 'ok' : ''}">${tc ? 'Saved' : 'Not done'}</span></div>
+      <div class="mut">${tc ? 'Saved at ' + fmtTime(tc.ts) + '. You can count again if you need to; the latest count is used.' : 'Count the listed items just before closing.'}</div></div>
+    <div class="card"><div class="row"><h3>Waiting to sync</h3><span class="pill ${S.queue.length ? 'warn' : 'ok'}">${S.queue.length}</span></div>
+      <div class="mut">Last sync: ${fmtTime(S.lastSync)}. No signal is needed until you sync at the end of the shift.</div></div>`;
+}
+
+const reasonList = () => (S.pkg && S.pkg.reasons && S.pkg.reasons.length ? S.pkg.reasons : DEFAULT_REASONS);
+
+function vReceive() {
+  if (U.view && U.view.t === 'receive') {
+    const t = S.pkg.transfers.find((x) => x.id === U.view.id);
+    if (!t) { U.view = null; return vReceive(); }
+    const d = S.draft['r:' + t.id] || {}, rr = S.draft['rr:' + t.id] || {}, pd = S.draft['p:' + t.id] || {};
+    return `<div class="card"><div class="row"><h3>${esc(t.id)}</h3><button class="btn sm" id="back">Back</button></div>
+       ${t.deliveredBy ? `<div class="mut">Delivered by <b>${esc(t.deliveredBy)}</b></div>` : ''}${t.partial ? '<div class="msg warn" style="margin:8px 0">Part of this transfer already arrived. Only the lines still to come are listed.</div>' : ''}<div class="msg warn" style="margin:8px 0"><b>Count first.</b> Open the boxes and count each item. Type what you actually counted. Do not copy the packing slip.</div>
+      ${t.lines.map((l) => `<div class="item" id="rl-${esc(l.sku)}"><div class="row"><div><b>${esc(l.name)}</b><div class="mut">SKU ${esc(l.sku)} · slip says ${l.sent}</div></div>
+        <div style="display:flex;gap:6px;align-items:center">${pd[l.sku] ? '<span class="pill warn">Not here yet</span>' : `<input class="q" type="number" inputmode="numeric" min="0" placeholder="?" data-rl="${esc(l.sku)}" value="${d[l.sku] != null ? esc(d[l.sku]) : ''}"><button class="btn sm" data-same="${esc(l.sku)}" data-sent="${l.sent}">Same as slip</button>`}<button class="btn sm" data-pend="${esc(l.sku)}">${pd[l.sku] ? 'It arrived' : 'Not here yet'}</button></div></div>
+        <div class="${!pd[l.sku] && d[l.sku] != null && String(d[l.sku]).trim() !== '' && Number(d[l.sku]) !== l.sent ? '' : 'hide'}" id="rsn-${esc(l.sku)}" style="margin-top:8px">
+          <label>Why is it different from the slip?</label>
+          <select data-reason="${esc(l.sku)}"><option value="">Choose a reason</option>${reasonList().map((x) => `<option ${(rr[l.sku] || {}).reason === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>
+          <input type="text" data-rnote="${esc(l.sku)}" placeholder="Note (needed if Other)" value="${esc((rr[l.sku] || {}).note || '')}" style="margin-top:6px"></div></div>`).join('')}
+      <div class="mut" style="margin-top:8px">If some boxes did not come with the delivery, tap <b>Not here yet</b> on those items and receive the rest. The transfer stays open for the missing items.</div>
+      <div style="height:12px"></div><button class="btn pri wide" id="saverecv">Save receipt on this phone</button></div>`;
+  }
+  const open = S.pkg.transfers.filter((t) => !S.queue.some((e) => e.type === 'receive' && e.transfer === t.id));
+  const waiting = S.queue.filter((e) => e.type === 'receive').map((e) => Object.assign({ waiting: true }, e));
+  const synced = S.log.filter((e) => e.type === 'receive').slice(-5).reverse();
+  const card = (e) => {
+    const diffs = (e.lines || []).filter((l) => !l.pending && l.sent != null && l.received !== l.sent);
+    return `<div class="item"><div class="row"><b>${esc(e.transfer)}</b><span class="pill ${diffs.length ? 'warn' : 'ok'}">${diffs.length ? 'Difference' : 'Matches slip'}</span></div>
+      <div class="mut">${fmtTime(e.ts)}${e.user ? ' by ' + esc(e.user) : ''} · ${e.waiting ? 'waiting to sync' : 'synced'}</div>
+      ${diffs.map((l) => `<div style="margin-top:4px;color:var(--warn-d);font-weight:600">${esc(l.name || l.sku)}: slip ${l.sent}, received ${l.received} (${l.received < l.sent ? l.sent - l.received + ' short' : l.received - l.sent + ' extra'})${l.reason ? ' · ' + esc(l.reason) : ''}</div>`).join('')}</div>`;
+  };
+  return `<div class="card"><h3>Boxes arrived but not listed?</h3><div class="mut">A transfer sent after your last sync is not on this phone yet. With a signal, tap below. It only checks for new transfers; nothing is closed or sent.</div>
+    <div style="height:8px"></div><button class="btn wide${U.checking ? ' busy' : ''}" id="chk" ${U.checking ? 'disabled' : ''}>${U.checking ? 'Checking...' : 'Check for new transfers'}</button></div>
+    <div class="card"><h3>Transfers on the way</h3>${open.length ? open.map((t) => `<div class="item row"><div><b>${esc(t.id)}</b><div class="mut">${t.lines.length} items${t.partial ? ' still to come' : ''} · sent ${fmtTime(t.ts)}${t.deliveredBy ? ' · delivered by ' + esc(t.deliveredBy) : ''}</div></div><button class="btn sm pri" data-open="${esc(t.id)}">Receive</button></div>`).join('') : '<div class="mut">Nothing waiting. New transfers appear after the next sync.</div>'}</div>
+    ${waiting.length ? `<div class="card"><h3>Saved, waiting to sync</h3>${waiting.map(card).join('')}</div>` : ''}
+    ${synced.length ? `<div class="card"><h3>Recently synced</h3>${synced.map(card).join('')}</div>` : ''}`;
+}
+
+function vCount() {
+  if (U.view && U.view.t === 'recount') {
+    const rc = pendingRecounts(), d = S.draft.recount || {};
+    if (!rc.length) { U.view = null; return vCount(); }
+    return `<div class="card"><div class="row"><h3>Recount</h3><button class="btn sm" id="back">Back</button></div>
+      <div class="mut">Count only these items again, exactly as they are now on the shelf and in the drawer. Type every number.</div></div>
+      <div class="card">${rc.map((r) => `<div class="item row"><div><b>${esc(r.name)}</b><div class="mut">SKU ${esc(r.sku)}${r.note ? ' · ' + esc(r.note) : ''}</div></div>
+        <input class="q" type="number" inputmode="numeric" min="0" data-rc="${esc(r.sku)}" placeholder="?" value="${d[r.sku] != null ? esc(d[r.sku]) : ''}"></div>`).join('')}</div>
+      <button class="btn pri wide" id="saverecount">Save recount on this phone</button>`;
+  }
+  const rcCard = recountCard();
+  const list = S.pkg.countList;
+  const d = S.draft.count || {};
+  const tc = todayCount();
+  if (tc && !(U.view && U.view.t === 'count')) {
+    return rcCard + `<div class="card"><div class="row"><h3>Count saved</h3><span class="pill ok">${tc.counts.length} items</span></div>
+      <div class="mut">Saved at ${fmtTime(tc.ts)}. Differences appear in the admin report after you sync and the day's sales are loaded.</div>
+      <div style="height:12px"></div><button class="btn wide" id="recount">Count again</button></div>`;
+  }
+  if (!list.length) return '<div class="card">No items are on the count list. Ask the admin.</div>';
+  return rcCard + `<div class="card"><h3>End of shift count</h3>
+    <div class="mut">Count what is physically on the shelf and in the drawer. Only type a number for items you have. Items left blank are saved as 0. ${list.length} items.</div>
+    <div style="height:8px"></div><input type="search" id="cfind" placeholder="Find an item"></div>
+    <div class="card" id="clist">${list.map((p) => `<div class="item row" data-n="${esc((p.name + ' ' + p.sku).toLowerCase())}"><div><b>${esc(p.name)}</b><div class="mut">SKU ${esc(p.sku)}</div></div>
+      <input class="q" type="number" inputmode="numeric" min="0" data-c="${esc(p.sku)}" placeholder="0" value="${d[p.sku] != null ? esc(d[p.sku]) : ''}"></div>`).join('')}</div>
+    <button class="btn pri wide" id="savecount">Save count on this phone</button>`;
+}
+
+function vStock() {
+  const tc = todayCount();
+  if (!tc) return '<div class="card"><h3>Stock</h3><div class="mut">System stock is shown after you save today\'s count, so counts stay honest.</div></div>';
+  const rows = (S.pkg.stockList || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  return `<div class="card"><h3>System stock as of last sync</h3><div class="mut">${fmtTime(S.lastSync)}. Includes items received and items on the count list. Sync again to refresh.</div>
+    <div style="height:8px"></div><input type="search" id="sfind" placeholder="Find an item"></div>
+    <div class="card" id="slist">${rows.length ? rows.map((r) => `<div class="item row" data-n="${esc((r.name + ' ' + r.sku).toLowerCase())}"><span>${esc(r.name)}<div class="mut">SKU ${esc(r.sku)}</div></span><b>${r.qty}</b></div>`).join('') : '<div class="mut">No stock figures yet.</div>'}</div>`;
+}
+
+function vSync() {
+  return `<div class="card"><h3>Sync</h3>
+    <div class="mut">Do this once at the end of the shift, on the office Wi-Fi or a pocket wifi. It sends everything saved on this phone and loads the next shift's data. Syncing early is safe: nothing is closed or sent twice.</div>
+    <div style="height:10px"></div>
+    <div class="row"><span>Waiting to sync</span><b>${S.queue.length}</b></div>
+    <div class="row"><span>Last sync</span><b>${fmtTime(S.lastSync)}</b></div>
+    <div class="row"><span>App version</span><b>v3.4 (2026-11-21)</b></div>
+    <div style="height:14px"></div><button class="btn pri wide${U.busy ? ' busy' : ''}" id="sync" ${U.busy ? 'disabled' : ''}>${U.busy ? 'Sending...' : 'Sync now'}</button></div>
+    ${U.syncMsg || ''}`;
+}
+
+/* ------------------------------------------------------------- behaviour */
+
+function bind() {
+  document.getElementById('logout').onclick = () => { U.user = null; U.view = null; U.msg = null; render(); };
+  document.querySelectorAll('[data-tab]').forEach((b) => b.onclick = () => { U.tab = b.dataset.tab; U.view = null; U.msg = null; render(); });
+  document.querySelectorAll('[data-open]').forEach((b) => b.onclick = () => { U.view = { t: 'receive', id: b.dataset.open }; render(); });
+  const back = document.getElementById('back'); if (back) back.onclick = () => { U.view = null; render(); };
+  const showWhy = (sku) => {
+    const t = S.pkg.transfers.find((x) => x.id === U.view.id), l = t.lines.find((x) => x.sku === sku);
+    const v = ((S.draft['r:' + t.id] || {})[sku]), blank = v == null || String(v).trim() === '';
+    const box = document.getElementById('rsn-' + sku); if (box) box.classList.toggle('hide', blank || Number(v) === l.sent);
+  };
+  document.querySelectorAll('[data-rl]').forEach((i) => i.oninput = () => {
+    const k = 'r:' + U.view.id; S.draft[k] = S.draft[k] || {}; S.draft[k][i.dataset.rl] = i.value; save(); showWhy(i.dataset.rl);
+  });
+  document.querySelectorAll('[data-reason]').forEach((i) => i.onchange = () => {
+    const k = 'rr:' + U.view.id; S.draft[k] = S.draft[k] || {}; (S.draft[k][i.dataset.reason] = S.draft[k][i.dataset.reason] || {}).reason = i.value; save();
+  });
+  document.querySelectorAll('[data-rnote]').forEach((i) => i.oninput = () => {
+    const k = 'rr:' + U.view.id; S.draft[k] = S.draft[k] || {}; (S.draft[k][i.dataset.rnote] = S.draft[k][i.dataset.rnote] || {}).note = i.value; save();
+  });
+  document.querySelectorAll('[data-same]').forEach((b) => b.onclick = () => {
+    const i = document.querySelector('[data-rl="' + b.dataset.same + '"]'); i.value = b.dataset.sent;
+    const k = 'r:' + U.view.id; S.draft[k] = S.draft[k] || {}; S.draft[k][b.dataset.same] = b.dataset.sent; save();
+    document.getElementById('rl-' + b.dataset.same).style.outline = ''; showWhy(b.dataset.same);
+  });
+  document.querySelectorAll('[data-pend]').forEach((b) => b.onclick = () => {
+    const k = 'p:' + U.view.id; S.draft[k] = S.draft[k] || {}; S.draft[k][b.dataset.pend] = !S.draft[k][b.dataset.pend]; save(); render();
+  });
+  const sr = document.getElementById('saverecv'); if (sr) sr.onclick = saveReceipt;
+  document.querySelectorAll('[data-c]').forEach((i) => i.oninput = () => { S.draft.count = S.draft.count || {}; S.draft.count[i.dataset.c] = i.value; save(); });
+  const dr = document.getElementById('dorecount'); if (dr) dr.onclick = () => { U.tab = 'count'; U.view = { t: 'recount' }; render(); };
+  document.querySelectorAll('[data-rc]').forEach((i) => i.oninput = () => { S.draft.recount = S.draft.recount || {}; S.draft.recount[i.dataset.rc] = i.value; save(); });
+  const srr = document.getElementById('saverecount'); if (srr) srr.onclick = saveRecount;
+  const sc = document.getElementById('savecount'); if (sc) sc.onclick = saveCount;
+  const rc = document.getElementById('recount'); if (rc) rc.onclick = () => { U.view = { t: 'count' }; render(); };
+  const cf = document.getElementById('cfind'); if (cf) cf.oninput = () => {
+    const q = cf.value.trim().toLowerCase();
+    document.querySelectorAll('#clist [data-n]').forEach((r) => r.classList.toggle('hide', q && r.dataset.n.indexOf(q) < 0));
+  };
+  const sf = document.getElementById('sfind'); if (sf) sf.oninput = () => {
+    const q = sf.value.trim().toLowerCase();
+    document.querySelectorAll('#slist [data-n]').forEach((r) => r.classList.toggle('hide', q && r.dataset.n.indexOf(q) < 0));
+  };
+  const ck = document.getElementById('chk'); if (ck) ck.onclick = checkTransfers;
+  const sy = document.getElementById('sync'); if (sy) sy.onclick = doSync;
+}
+
+function saveReceipt() {
+  const t = S.pkg.transfers.find((x) => x.id === U.view.id), d = S.draft['r:' + t.id] || {};
+  const isBlank = (v) => v === undefined || v === null || String(v).trim() === '';
+  const pd = S.draft['p:' + t.id] || {};
+  const empty = t.lines.filter((l) => !pd[l.sku] && isBlank(d[l.sku]));
+  if (t.lines.every((l) => pd[l.sku])) { U.msg = { k: 'bad', t: 'Receive at least one item. If nothing has arrived, leave this transfer and check again later.' }; return render(); }
+  if (empty.length) {   // every line must be counted: nothing is pre-filled from the slip
+    empty.forEach((l) => { const el = document.getElementById('rl-' + l.sku); if (el) el.style.outline = '2px solid var(--bad-d)'; });
+    U.msg = { k: 'bad', t: empty.length + ' item(s) have no number yet. Type what you counted, or tap Same as slip if it matches.' };
+    render(); empty.forEach((l) => { const el = document.getElementById('rl-' + l.sku); if (el) el.style.outline = '2px solid var(--bad-d)'; });
+    window.scrollTo(0, 0); return;
+  }
+  const lines = t.lines.map((l) => pd[l.sku] ? { sku: l.sku, name: l.name, sent: l.sent, pending: true } : { sku: l.sku, name: l.name, sent: l.sent, received: Number(d[l.sku]) });
+  if (lines.some((l) => !l.pending && (isNaN(l.received) || l.received < 0))) { U.msg = { k: 'bad', t: 'Check the quantities. They must be 0 or more.' }; return render(); }
+  const rr = S.draft['rr:' + t.id] || {};
+  const diffLines = lines.filter((l) => !l.pending && l.received !== l.sent);
+  const noWhy = diffLines.filter((l) => !(rr[l.sku] && rr[l.sku].reason) || (rr[l.sku].reason === 'Other' && !String(rr[l.sku].note || '').trim()));
+  if (noWhy.length) {   // a difference is explained, not just recorded
+    U.msg = { k: 'bad', t: 'Say why ' + noWhy.length + ' item(s) differ from the slip. Choose a reason (and add a note if you choose Other).' };
+    render(); noWhy.forEach((l) => { const el = document.getElementById('rl-' + l.sku); if (el) el.style.outline = '2px solid var(--bad-d)'; });
+    window.scrollTo(0, 0); return;
+  }
+  diffLines.forEach((l) => { l.reason = rr[l.sku].reason; l.note = String(rr[l.sku].note || '').trim(); });
+  const extra = lines.filter((l) => !l.pending && l.received > l.sent);
+  if (extra.length && !confirm('Check again. You counted MORE than the packing slip:\n\n' + extra.map((l) => l.name + ': slip ' + l.sent + ', you typed ' + l.received).join('\n') + '\n\nIs your count right?')) return;
+  const diffs = lines.filter((l) => !l.pending && l.received !== l.sent), pend = lines.filter((l) => l.pending);
+  const summary = (pend.length ? 'NOT here yet (the transfer stays open for these):\n' + pend.map((l) => l.name).join('\n') + '\n\n' : '') + (diffs.length
+    ? 'These quantities do NOT match the packing slip:\n\n' + diffs.map((l) => l.name + ': slip ' + l.sent + ', received ' + l.received + ' (' + (l.received < l.sent ? (l.sent - l.received) + ' short' : (l.received - l.sent) + ' extra') + ')').join('\n') + '\n\nSave this receipt?'
+    : 'All ' + (lines.length - pend.length) + ' item(s) received match the packing slip. Save this receipt?');
+  if (!confirm(summary)) return;
+  S.queue.push({ id: uuid(), type: 'receive', ts: new Date().toISOString(), user: U.user, transfer: t.id, lines });
+  delete S.draft['r:' + t.id]; delete S.draft['rr:' + t.id]; delete S.draft['p:' + t.id]; save();
+  U.view = null; U.msg = { k: diffs.length ? 'warn' : 'ok', t: diffs.length ? 'Receipt saved with ' + diffs.length + ' difference(s) from the packing slip. It stays listed below until the admin has it.' : 'Receipt saved on this phone.' }; toast('ok', 'Receipt saved on this phone.', 3500); render();
+}
+
+function saveRecount() {
+  const rc = pendingRecounts(), d = S.draft.recount || {};
+  const isBlank = (v) => v === undefined || v === null || String(v).trim() === '';
+  if (rc.some((r) => isBlank(d[r.sku]) || isNaN(Number(d[r.sku])) || Number(d[r.sku]) < 0)) { U.msg = { k: 'bad', t: 'Type a number (0 or more) for every item you are recounting.' }; return render(); }
+  S.queue.push({ id: uuid(), type: 'count', recount: true, ts: new Date().toISOString(), user: U.user, counts: rc.map((r) => ({ sku: r.sku, counted: Number(d[r.sku]) })) });
+  delete S.draft.recount; save(); U.view = null; U.msg = { k: 'ok', t: 'Recount saved on this phone. Sync to send it to the office.' }; toast('ok', 'Recount saved on this phone.', 3500); render();
+}
+
+function saveCount() {
+  const d = S.draft.count || {};
+  const isBlank = (v) => v === undefined || v === null || String(v).trim() === '';
+  const counts = S.pkg.countList.map((p) => ({ sku: p.sku, counted: isBlank(d[p.sku]) ? 0 : d[p.sku], blank: isBlank(d[p.sku]) }));
+  const invalid = counts.filter((c) => isNaN(Number(c.counted)) || Number(c.counted) < 0);
+  if (invalid.length) { U.msg = { k: 'bad', t: invalid.length + ' item(s) have an invalid number. Use 0 or more.' }; return render(); }
+  const blanks = counts.filter((c) => c.blank).length;
+  if (blanks && !confirm(blanks + ' item(s) have no number and will be saved as 0. Continue?')) return;
+  S.queue.push({ id: uuid(), type: 'count', ts: new Date().toISOString(), user: U.user, counts: counts.map((c) => ({ sku: c.sku, counted: Number(c.counted) })) });
+  delete S.draft.count; save(); U.view = null; U.msg = { k: 'ok', t: 'Count saved on this phone.' }; toast('ok', 'Count saved on this phone.', 3500); render();
+}
+
+async function checkTransfers() {
+  U.checking = true; U.msg = null; toast('work', 'Checking for new transfers... please wait'); render();
+  try {
+    const r = await api({ action: 'transfers_check', branch: S.cfg.branch, key: S.cfg.key });
+    const before = S.pkg.transfers.length;
+    S.pkg.transfers = r.transfers; S.pkg.recounts = r.recounts || []; save();
+    const added = r.transfers.filter((t) => !S.queue.some((e) => e.type === 'receive' && e.transfer === t.id)).length;
+    U.msg = { k: 'ok', t: added ? added + ' transfer(s) waiting to be received.' : 'No new transfers. Nothing is waiting.' };
+    toast('ok', added ? 'New transfers loaded.' : 'No new transfers.', 3500);
+  } catch (e) { U.msg = { k: 'bad', t: e.message }; toast('bad', 'Could not check. Try again with a signal.', 6000); }
+  U.checking = false; render();
+}
+
+async function doSync() {
+  U.busy = true; U.syncMsg = null; render();
+  const sending = S.queue.slice();
+  toast('work', sending.length ? 'Sending ' + sending.length + ' entr' + (sending.length > 1 ? 'ies' : 'y') + ' to the office... please wait' : 'Checking for new data... please wait');
+  try {
+    const r = await api({ action: 'sync', branch: S.cfg.branch, key: S.cfg.key, entries: sending });
+    const bad = r.results.filter((x) => x.status === 'error');
+    const cancelled = r.results.filter((x) => x.status === 'cancelled');
+    const ok = new Set(r.results.filter((x) => x.status !== 'error').map((x) => x.id));
+    S.queue = S.queue.filter((e) => !ok.has(e.id));
+    sending.filter((e) => ok.has(e.id)).forEach((e) => S.log.push({ id: e.id, type: e.type, ts: e.ts, user: e.user, counts: e.counts, recount: e.recount, transfer: e.transfer, lines: e.lines }));
+    S.log = S.log.slice(-60);
+    S.pkg = r.data; S.lastSync = r.serverTime; save();
+    const disc = r.results.filter((x) => x.discrepancies && x.discrepancies.length);
+    const nRecv = r.results.filter((x) => x.type === 'receive' && x.status !== 'error' && x.status !== 'cancelled').length;
+    const nCnt = r.results.filter((x) => x.type === 'count' && x.status !== 'error').length;
+    U.syncMsg = `<div class="msg ok"><b>Sync complete.</b><br>${nRecv} receipt(s) and ${nCnt} count(s) received.${disc.length ? ' ' + disc.length + ' receipt(s) had differences from the packing slip; the admin will follow up.' : ''}<br>Tomorrow's data is loaded.</div>` +
+      cancelled.map((c) => `<div class="msg warn">${esc(c.message)}</div>`).join('') +
+      (bad.length ? `<div class="msg bad">${bad.length} entr${bad.length > 1 ? 'ies were' : 'y was'} not accepted: ${esc(bad.map((b) => b.message).join('; '))}. Show this to the admin.</div>` : '');
+    toast('ok', bad.length ? 'Sync finished, but ' + bad.length + ' entr' + (bad.length > 1 ? 'ies were' : 'y was') + ' not accepted.' : 'Sync complete. Everything is saved at the office.', 6000);
+  } catch (e) { U.syncMsg = `<div class="msg bad">${esc(e.message)}</div>`; toast('bad', 'Not synced. Your entries are still safe on this phone.', 7000); }
+  U.busy = false; render();
+}
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+render();
+</script>
+</body>
+</html>

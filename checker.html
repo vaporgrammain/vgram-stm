@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0B5D5B">
+<title>Vgram Mid-day Check</title>
+<link rel="icon" href="icon.svg">
+<link rel="stylesheet" href="common.css">
+<script src="config.js"></script>
+</head>
+<body>
+<div class="topbar" id="topbar"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div id="app"></div>
+<script>
+/* Mid-day check page for the back-office checker. He visits a branch, counts what is on the shelf, and logs it here.
+   The page keeps the branch data on the phone, so a visit can be done with no signal. Visits wait on the phone
+   and are sent when there is internet. A visit never changes stock. */
+'use strict';
+const KEY = 'vgram.checker.v1';
+const $app = document.getElementById('app');
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+const fmt = (d) => d ? new Date(d).toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'never';
+const manilaDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+const num = (v) => { const n = Number(v); return isNaN(n) ? 0 : n; };
+const blank = (v) => v === undefined || v === null || String(v).trim() === '';
+
+function load() { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } }
+let S = load();                       // kept on the phone: cached branch data, waiting visits, hashed PIN
+S.queue = S.queue || []; S.draft = S.draft || {};
+function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast('bad', 'This phone is out of storage space.', 7000); } }
+const U = { pin: sessionStorage.getItem('vg.chk.pin') || '', name: S.name || '', branch: null, msg: null, busy: false, find: '' };
+
+async function sha256(s) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+let inflight = 0, toastTimer = null;
+function bar(d) { inflight = Math.max(0, inflight + d); document.getElementById('topbar').classList.toggle('on', inflight > 0); }
+function toast(kind, text, ms) {
+  const t = document.getElementById('toast'); clearTimeout(toastTimer);
+  if (!kind) { t.className = 'toast'; return; }
+  t.className = 'toast show ' + kind;
+  t.innerHTML = (kind === 'work' ? '<span class="spin"></span>' : kind === 'ok' ? '<span>&#10003;</span>' : '<span>!</span>') + '<span>' + esc(text) + '</span>';
+  if (ms) toastTimer = setTimeout(() => { t.className = 'toast'; }, ms);
+}
+async function api(body) {
+  bar(1);
+  try { return await api_(body); } finally { bar(-1); }
+}
+async function api_(body) {
+  const url = window.VGRAM_API;
+  if (!url || url.indexOf('http') !== 0) throw new Error('The app address is not set yet. Ask the admin.');
+  let res;
+  try { res = await fetch(url, { method: 'POST', body: JSON.stringify(Object.assign({ pin: U.pin }, body)) }); }
+  catch (e) { const err = new Error('No internet right now.'); err.offline = true; throw err; }
+  let j; try { j = await res.json(); } catch (e) { throw new Error('The server did not answer properly. Try again.'); }
+  if (!j.ok) throw new Error(j.error || 'Something went wrong.');
+  return j;
+}
+
+/* ------------------------------------------------------------------ views */
+
+function render() {
+  if (!U.pin) return vLogin();
+  if (U.branch) return vBranch();
+  return vList();
+}
+
+function vLogin() {
+  $app.innerHTML = `<div class="bar"><b>Vgram Mid-day Check</b></div><div class="wrap" style="max-width:420px"><div class="card">
+    <label for="pin">PIN</label><input id="pin" type="password" inputmode="numeric" autocomplete="off"><div style="height:14px"></div>
+    <button class="btn pri wide" id="in">Sign in</button></div>${U.msg ? `<div class="msg ${U.msg.k}">${esc(U.msg.t)}</div>` : ''}
+    <div class="mut" style="text-align:center">Vgram Mid-day Check · v3.4 (2026-11-21)</div><div class="mut">The first sign-in each day needs internet. After you have loaded the branches you can do visits with no signal.</div></div>`;
+  const go = async () => {
+    const pin = document.getElementById('pin').value.trim(), btn = document.getElementById('in');
+    btn.disabled = true; btn.classList.add('busy'); btn.textContent = 'Signing in...';
+    const hash = await sha256('chk:' + pin);
+    try {
+      U.pin = pin;
+      const r = await api({ action: 'midday_data' });
+      if (r.role !== 'checker' && r.role !== 'admin') throw new Error('PIN not valid for this screen.');
+      S.data = r; S.name = r.name; S.pinHash = hash; U.name = r.name; save();
+      sessionStorage.setItem('vg.chk.pin', pin); U.msg = null; render();
+    } catch (e) {
+      U.pin = '';
+      if (e.offline && S.data && S.pinHash === hash) {            // no signal: the PIN is checked against the one used last time
+        U.pin = pin; sessionStorage.setItem('vg.chk.pin', pin); U.name = S.name; U.msg = { k: 'warn', t: 'No internet. Using the branch data saved on this phone.' }; render();
+      } else { U.msg = { k: 'bad', t: e.offline ? 'No internet, and this phone has no saved data for that PIN yet.' : e.message }; render(); }
+    }
+  };
+  document.getElementById('in').onclick = go;
+  document.getElementById('pin').onkeydown = (e) => { if (e.key === 'Enter') go(); };
+}
+
+function vList() {
+  const d = S.data || { branches: [] };
+  const waiting = S.queue.length;
+  $app.innerHTML = `<div class="bar"><div><b>Mid-day Check</b><small>${esc(U.name)} · data from ${fmt(d.serverTime)}</small></div><button class="btn sm" id="out">Sign out</button></div>
+    <div class="wrap">${U.msg ? `<div class="msg ${U.msg.k}">${esc(U.msg.t)}</div>` : ''}
+    <div class="card"><div class="row"><h3>Visits waiting to send</h3><span class="pill ${waiting ? 'warn' : 'ok'}">${waiting}</span></div>
+      <div class="mut">${waiting ? 'They are saved on this phone and are sent when there is internet.' : 'Nothing waiting.'}</div>
+      <div style="height:10px"></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn pri" id="refresh" ${U.busy ? 'disabled' : ''}>Refresh branch data</button>${waiting ? `<button class="btn" id="sendq" ${U.busy ? 'disabled' : ''}>Send waiting visits</button>` : ''}</div>
+      <div class="mut" style="margin-top:8px">Refresh before you leave the office, on Wi-Fi, so the opening stock is up to date.</div></div>
+    <div class="card"><h3>Choose a branch</h3>${d.branches.map((b) => {
+      const today = b.lastChecked && manilaDate(b.lastChecked) === manilaDate(Date.now()) || S.queue.some((v) => v.branch === b.code && manilaDate(v.ts) === manilaDate(Date.now()));
+      return `<div class="item row"><div><b>${esc(b.name)}</b><div class="mut">Last checked: ${b.lastChecked ? fmt(b.lastChecked) : 'never'}${b.openingFrom ? ' · opening from ' + esc(b.openingFrom) : ''}</div></div>
+        ${b.items.length ? `<button class="btn sm pri" data-b="${esc(b.code)}">${today ? 'Check again' : 'Check'}</button>` : '<span class="pill warn">No opening stock</span>'}</div>`;
+    }).join('') || '<div class="mut">No branch data yet. Tap Refresh branch data.</div>'}</div></div>`;
+  document.getElementById('out').onclick = () => { sessionStorage.removeItem('vg.chk.pin'); U.pin = ''; U.branch = null; render(); };
+  document.getElementById('refresh').onclick = refresh;
+  const sq = document.getElementById('sendq'); if (sq) sq.onclick = () => sendQueue(true);
+  document.querySelectorAll('[data-b]').forEach((b) => b.onclick = () => { U.branch = b.dataset.b; U.find = ''; U.msg = null; render(); });
+}
+
+function branchData() { return ((S.data || {}).branches || []).find((b) => b.code === U.branch); }
+function draftOf(code) { return S.draft[code] = S.draft[code] || {}; }
+
+function expectedOf(it, x) { return it.opening + (it.received || 0) - (blank(x && x.sold) ? 0 : num(x.sold)); }
+function rowHtml(it, dr) {
+  const x = dr[it.sku] || {};
+  const has = !blank(x.actual), exp = expectedOf(it, x), diff = has ? num(x.actual) - exp : 0;
+  return `<div class="item" data-n="${esc((it.name + ' ' + it.sku).toLowerCase())}" data-sku="${esc(it.sku)}">
+    <div class="row"><div><b>${esc(it.name)}</b><div class="mut">SKU ${esc(it.sku)} · opening ${it.opening} · received ${it.received || 0}</div>
+      <div class="mut">Expected now: <b data-exp="${esc(it.sku)}">${exp}</b></div></div>
+      <div style="display:flex;gap:6px;align-items:center"><input class="q" type="number" inputmode="numeric" min="0" placeholder="?" data-a="${esc(it.sku)}" value="${has ? esc(x.actual) : ''}"></div></div>
+    <div class="row" style="margin-top:4px;gap:6px"><span data-flag="${esc(it.sku)}">${flagHtml(has, diff)}</span>
+      <span style="display:flex;gap:6px;align-items:center"><span class="mut">Sold so far</span><input class="q" type="number" inputmode="numeric" min="0" placeholder="0" data-s="${esc(it.sku)}" value="${blank(x.sold) ? '' : esc(x.sold)}">
+      <button class="btn sm" data-m="${esc(it.sku)}">Matches</button></span></div>
+    <div class="row" style="margin-top:4px"><input type="text" data-note="${esc(it.sku)}" placeholder="Note (optional)" value="${esc(x.note || '')}"></div></div>`;
+}
+function flagHtml(has, diff) {
+  if (!has) return '<span class="mut">not checked</span>';
+  return diff === 0 ? '<span class="pill ok">Matches</span>' : `<span class="pill bad">${diff > 0 ? '+' : ''}${diff} vs expected</span>`;
+}
+
+function vBranch() {
+  const b = branchData(); if (!b) { U.branch = null; return render(); }
+  const dr = draftOf(b.code);
+  const checked = b.items.filter((i) => !blank((dr[i.sku] || {}).actual));
+  const differs = checked.filter((i) => num(dr[i.sku].actual) !== expectedOf(i, dr[i.sku])).length;
+  $app.innerHTML = `<div class="bar"><div><b>${esc(b.name)}</b><small>Opening from ${esc(b.openingFrom)} (${esc(b.openingSource)})</small></div><button class="btn sm" id="back">Back</button></div>
+    <div class="wrap" style="padding-bottom:110px">${U.msg ? `<div class="msg ${U.msg.k}">${esc(U.msg.t)}</div>` : ''}
+    <div class="card"><div class="mut">Count what is on the shelf and in the drawer. Only type a number for the items you check. Items left blank are not part of this visit. Expected now = opening + received - sold so far. Sold so far is optional; look at the POS if you want a tighter check.</div>
+      <div style="height:8px"></div><input type="search" id="find" placeholder="Find an item" value="${esc(U.find)}"></div>
+    <div class="card" id="list">${b.items.map((i) => rowHtml(i, dr)).join('') || '<div class="mut">No items.</div>'}</div></div>
+    <div class="tabs" style="flex-direction:column;gap:6px;padding:10px"><div class="row"><span><b id="ccount">${checked.length}</b> checked · <b id="cdiff" style="color:var(--bad-d)">${differs}</b> differ</span>
+      <button class="btn pri" id="savev" ${U.busy ? 'disabled' : ''}>Save visit</button></div></div>`;
+  document.getElementById('back').onclick = () => { U.branch = null; U.msg = null; render(); };
+  const f = document.getElementById('find'); const apply = () => {
+    U.find = f.value; const q = f.value.trim().toLowerCase();
+    document.querySelectorAll('#list [data-n]').forEach((r) => r.classList.toggle('hide', q && r.dataset.n.indexOf(q) < 0));
+  }; f.oninput = apply; apply();
+  const refreshRow = (it) => {
+    const x = dr[it.sku] || {}, has = !blank(x.actual), exp = expectedOf(it, x);
+    document.querySelector('[data-exp="' + it.sku + '"]').textContent = exp;
+    document.querySelector('[data-flag="' + it.sku + '"]').innerHTML = flagHtml(has, has ? num(x.actual) - exp : 0); recount(b);
+  };
+  const item = (sku) => b.items.find((x) => x.sku === sku);
+  document.querySelectorAll('[data-a]').forEach((i) => i.oninput = () => { const it = item(i.dataset.a); (dr[it.sku] = dr[it.sku] || {}).actual = i.value; save(); refreshRow(it); });
+  document.querySelectorAll('[data-s]').forEach((i) => i.oninput = () => { const it = item(i.dataset.s); (dr[it.sku] = dr[it.sku] || {}).sold = i.value; save(); refreshRow(it); });
+  document.querySelectorAll('[data-m]').forEach((i) => i.onclick = () => {
+    const it = item(i.dataset.m); (dr[it.sku] = dr[it.sku] || {}).actual = String(expectedOf(it, dr[it.sku]));
+    document.querySelector('[data-a="' + it.sku + '"]').value = dr[it.sku].actual; save(); refreshRow(it);
+  });
+  document.querySelectorAll('[data-note]').forEach((i) => i.oninput = () => { (dr[i.dataset.note] = dr[i.dataset.note] || {}).note = i.value; save(); });
+  document.getElementById('savev').onclick = saveVisit;
+}
+function recount(b) {
+  const dr = draftOf(b.code), checked = b.items.filter((i) => !blank((dr[i.sku] || {}).actual));
+  document.getElementById('ccount').textContent = checked.length;
+  document.getElementById('cdiff').textContent = checked.filter((i) => num(dr[i.sku].actual) !== expectedOf(i, dr[i.sku])).length;
+}
+
+/* ------------------------------------------------------------- behaviour */
+
+function saveVisit() {
+  const b = branchData(), dr = draftOf(b.code);
+  const rows = b.items.filter((i) => !blank((dr[i.sku] || {}).actual)).map((i) => ({ sku: i.sku, opening: i.opening, received: i.received || 0, sold: blank(dr[i.sku].sold) ? 0 : Number(dr[i.sku].sold), actual: Number(dr[i.sku].actual), note: String(dr[i.sku].note || '').trim() }));
+  if (!rows.length) { U.msg = { k: 'bad', t: 'Enter a count for at least one item first.' }; return render(); }
+  if (rows.some((r) => isNaN(r.actual) || r.actual < 0 || isNaN(r.sold) || r.sold < 0)) { U.msg = { k: 'bad', t: 'Check the numbers. They must be 0 or more.' }; return render(); }
+  const differs = rows.filter((r) => r.actual !== r.opening + r.received - r.sold).length;
+  if (!confirm('Save this visit to ' + b.name + '?\n\n' + rows.length + ' item(s) checked, ' + differs + ' differ.')) return;
+  S.queue.push({ id: uuid(), branch: b.code, branchName: b.name, ts: new Date().toISOString(), rows });
+  delete S.draft[b.code]; save();
+  U.branch = null; U.msg = { k: 'ok', t: 'Visit to ' + b.name + ' saved on this phone.' }; toast('ok', 'Visit saved on this phone.', 3500);
+  render(); sendQueue(false);
+}
+
+async function sendQueue(manual) {
+  if (U.busy || !S.queue.length) return;
+  U.busy = true; if (manual) toast('work', 'Sending ' + S.queue.length + ' visit(s)... please wait');
+  let sent = 0, failed = 0;
+  try {
+    for (const v of S.queue.slice()) {
+      try {
+        await api({ action: 'midday_save', id: v.id, branch: v.branch, ts: v.ts, rows: v.rows });
+        S.queue = S.queue.filter((x) => x.id !== v.id); save(); sent++;
+      } catch (e) {
+        if (e.offline) { if (manual) toast('bad', 'No internet. The visit stays saved on this phone.', 6000); break; }
+        failed++; U.msg = { k: 'bad', t: v.branchName + ': ' + e.message }; break;   // a refused visit stays in the queue so it is not lost
+      }
+    }
+  } finally { U.busy = false; }
+  if (sent) { toast('ok', sent + ' visit(s) sent to the office.', 5000); U.msg = U.msg || { k: 'ok', t: sent + ' visit(s) sent to the office.' }; refresh(true); }
+  else render();
+}
+
+async function refresh(quiet) {
+  if (U.busy && quiet !== true) return;
+  U.busy = true; if (quiet !== true) { toast('work', 'Loading branch data... please wait'); render(); }
+  try {
+    const r = await api({ action: 'midday_data' }); S.data = r; save();
+    if (quiet !== true) { U.msg = { k: 'ok', t: 'Branch data is up to date.' }; toast('ok', 'Branch data loaded.', 3500); }
+  } catch (e) { if (quiet !== true) { U.msg = { k: 'bad', t: e.offline ? 'No internet. Using the data saved on this phone.' : e.message }; toast('bad', e.message, 6000); } }
+  U.busy = false; render();
+}
+
+window.addEventListener('online', () => { if (U.pin && S.queue.length) sendQueue(false); });
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+render();
+if (U.pin && S.queue.length) sendQueue(false);
+</script>
+</body>
+</html>
